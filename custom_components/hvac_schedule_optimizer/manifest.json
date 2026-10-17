@@ -1,0 +1,13 @@
+{
+  "domain": "hvac_schedule_optimizer",
+  "name": "HVAC Schedule Optimizer",
+  "codeowners": ["@jumpinjet22"],
+  "config_flow": true,
+  "dependencies": ["recorder", "http", "frontend", "websocket_api"],
+  "documentation": "https://github.com/jumpinjet22/hvac-schedule-optimizer",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/jumpinjet22/hvac-schedule-optimizer/issues",
+  "requirements": [],
+  "version": "0.2.0"
+}

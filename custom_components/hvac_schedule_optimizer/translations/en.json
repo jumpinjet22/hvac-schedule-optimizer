@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HVAC Schedule Optimizer",
+        "description": "Pick the thermostat to schedule. If your indoor temperature comes from a separate sensor you trust more than the thermostat's own reading, add it too. Turn off any other scheduler (such as Climate Scheduler) for this thermostat so they do not fight.",
+        "data": {
+          "climate_entity": "Thermostat",
+          "indoor_sensor": "Indoor temperature sensor (optional)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This thermostat is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Comfort limits and schedule",
+        "description": "Temperatures use your Home Assistant unit. The optimizer only proposes schedules that keep the house under these limits. The baseline is your current schedule, used for the savings comparison and as the starting schedule.",
+        "data": {
+          "awake_start": "Awake from (hour)",
+          "awake_end": "Awake until (hour)",
+          "awake_max": "Maximum temperature while awake",
+          "sleep_start": "Asleep from (hour)",
+          "sleep_end": "Asleep until (hour)",
+          "sleep_max": "Maximum temperature while asleep",
+          "hysteresis": "Thermostat swing around the setpoint",
+          "baseline_wake_hour": "Current schedule: day starts (hour)",
+          "baseline_day_temp": "Current schedule: day temperature",
+          "baseline_sleep_hour": "Current schedule: night starts (hour)",
+          "baseline_night_temp": "Current schedule: night temperature",
+          "run_time": "Daily optimizer run time",
+          "history_days": "Days of history to learn from"
+        }
+      }
+    }
+  }
+}
