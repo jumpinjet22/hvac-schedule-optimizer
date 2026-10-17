@@ -24,7 +24,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.2.0"
+CARD_VERSION = "0.2.1"
 
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
 
