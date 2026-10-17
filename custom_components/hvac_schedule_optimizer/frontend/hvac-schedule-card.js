@@ -11,6 +11,7 @@ const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const ROOM_COLORS = ["#ab47bc", "#26a69a", "#ef6c00", "#5c6bc0", "#ec407a", "#9e9d24", "#8d6e63", "#29b6f6"];
+const HIDDEN_KEY = "hvac-schedule-card:hidden-rooms";
 const ROOM_WHEN = { always: "always", awake: "awake hours", asleep: "sleep hours", never: "watch only" };
 
 const STATUS = {
@@ -46,6 +47,7 @@ svg { display: block; width: 100%; height: auto; touch-action: pan-y; user-selec
 svg text { font-family: var(--paper-font-body1_-_font-family, inherit); fill: var(--hso-muted); font-size: 10.5px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 2px 0; font-size: .72rem; color: var(--hso-muted); }
 .legend i { display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 5px; }
+.legend .room { cursor: pointer; user-select: none; } .legend .room.off { opacity: .4; text-decoration: line-through; }
 .legend i.dash { border-top-style: dashed; } .legend i.box { height: 8px; border: 0; border-radius: 2px; }
 .tip { position: absolute; pointer-events: none; z-index: 2; min-width: 150px; padding: 8px 10px; border-radius: 10px; font-size: .74rem;
   background: var(--card-background-color, #fff); color: var(--primary-text-color); box-shadow: 0 4px 18px rgba(0,0,0,.28);
@@ -133,6 +135,25 @@ class HvacScheduleCard extends HTMLElement {
     this._busy = false;
     this._timer = null;
     this._loaded = false;
+    this._hiddenPref = {};
+    try {
+      this._hiddenPref = JSON.parse(localStorage.getItem(HIDDEN_KEY) || "{}") || {};
+    } catch (_) {
+      this._hiddenPref = {};
+    }
+  }
+
+  // Rooms set to "watch only" start hidden; a tap on the legend overrides that per device.
+  _roomHidden(room) {
+    return room.id in this._hiddenPref ? !!this._hiddenPref[room.id] : room.when === "never";
+  }
+
+  _toggleRoom(id, hidden) {
+    this._hiddenPref = { ...this._hiddenPref, [id]: hidden };
+    try {
+      localStorage.setItem(HIDDEN_KEY, JSON.stringify(this._hiddenPref));
+    } catch (_) {}
+    this._render();
   }
 
   static getStubConfig(hass) {
@@ -350,9 +371,16 @@ class HvacScheduleCard extends HTMLElement {
       `<span><i class="box" style="background:var(--hso-cool)"></i>AC running</span>`,
       ...(r.series.rooms || []).map((room, k) => {
         const tag = room.trusted ? ROOM_WHEN[room.when] || room.when : "learning";
-        return `<span title="${this._esc(tag)}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
+        const off = this._roomHidden(room);
+        return `<span class="room ${off ? "off" : ""}" data-room="${this._esc(room.id)}" role="button" title="Tap to ${off ? "show" : "hide"}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
       }),
     ].join("");
+    node.querySelectorAll(".room").forEach((n) =>
+      n.addEventListener("click", () => {
+        const room = r.series.rooms.find((x) => x.id === n.dataset.room);
+        if (room) this._toggleRoom(room.id, !this._roomHidden(room));
+      })
+    );
   }
 
   // ------------------------------------------------------------------ chart
@@ -382,7 +410,7 @@ class HvacScheduleCard extends HTMLElement {
     });
 
     // indoor scale (left)
-    const rooms = s.rooms || [];
+    const rooms = (s.rooms || []).map((room, k) => ({ ...room, color: ROOM_COLORS[k % ROOM_COLORS.length] })).filter((room) => !this._roomHidden(room));
     const roomFuture = (room) => room.predicted.proposed || room.predicted.active || room.predicted.baseline || [];
     const ivals = [].concat(
       s.indoor_actual, s.indoor.proposed || [], s.indoor.active || s.indoor.baseline || [], refSp, propSp || [], limit,
@@ -450,8 +478,8 @@ class HvacScheduleCard extends HTMLElement {
     if (propSp) this._line(svg, propSp, X, Yi, { stroke: "var(--hso-accent, #03a9f4)", "stroke-width": 2, "stroke-dasharray": "6 4" }, true);
 
     // rooms: actual (past) solid, predicted (future, under the proposal when there is one) dashed
-    rooms.forEach((room, k) => {
-      const col = ROOM_COLORS[k % ROOM_COLORS.length];
+    rooms.forEach((room) => {
+      const col = room.color;
       this._line(svg, room.actual, X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": 0.85 }, false);
       this._line(svg, roomFuture(room), X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": room.trusted ? 0.85 : 0.4, "stroke-dasharray": "4 3" }, false);
     });

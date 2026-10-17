@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
@@ -13,6 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -52,6 +54,43 @@ def _num(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return v if v == v else None
+
+
+_TEMP_SUFFIX = re.compile(r"[\s_-]*\b(temperature|temp)\b\s*$", re.IGNORECASE)
+_GENERIC = {"", "air", "ambient", "room", "indoor", "inside", "sensor", "current"}
+
+
+def _strip_temp(name: str | None) -> str:
+    return _TEMP_SUFFIX.sub("", (name or "").strip()).strip()
+
+
+def _dedupe_words(name: str) -> str:
+    """'Master Bedroom Master Bedroom' -> 'Master Bedroom' (drops an immediately repeated run of words)."""
+    words = name.split()
+    i = 0
+    while i < len(words):
+        for k in range(len(words[i:]) // 2, 0, -1):
+            if [w.lower() for w in words[i : i + k]] == [w.lower() for w in words[i + k : i + 2 * k]]:
+                del words[i + k : i + 2 * k]
+                break
+        else:
+            i += 1
+    return " ".join(words)
+
+
+def room_name(hass: HomeAssistant, entity_id: str) -> str:
+    """Short label for a room sensor: the sensor's own name without 'Temperature', else its device's name."""
+    st = hass.states.get(entity_id)
+    full = st.name if st else entity_id
+    ent = er.async_get(hass).async_get(entity_id)
+    if ent and ent.has_entity_name and ent.device_id:
+        dev = dr.async_get(hass).async_get(ent.device_id)
+        own = _strip_temp(ent.name or ent.original_name)
+        if own.lower() not in _GENERIC:
+            return own
+        if dev and (dev_name := _strip_temp(dev.name_by_user or dev.name)):
+            return dev_name
+    return _strip_temp(_dedupe_words(full)) or full
 
 
 def baseline_nodes(hass: HomeAssistant, options: dict[str, Any]) -> list[dict]:
@@ -212,7 +251,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             rooms=[
                 {
                     "id": r,
-                    "name": (st.name if (st := self.hass.states.get(r)) else r),
+                    "name": room_name(self.hass, r),
                     "when": o[CONF_ROOM_WHEN].get(r, "always"),
                     "points": self._sensor_points(states.get(r, [])),
                 }
