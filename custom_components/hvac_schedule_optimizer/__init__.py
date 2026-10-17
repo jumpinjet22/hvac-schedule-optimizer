@@ -28,6 +28,8 @@ CARD_VERSION = "0.2.0"
 
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 SERVICE_SET_SCHEDULE = "set_schedule"
 
 _NODE = vol.Schema(
