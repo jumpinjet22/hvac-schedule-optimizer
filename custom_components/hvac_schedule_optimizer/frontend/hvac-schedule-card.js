@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.4.0";
+const CARD_VERSION = "0.4.0-beta.2";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -258,7 +258,7 @@ class HvacScheduleCard extends HTMLElement {
         <div>
           <div class="title">${this._esc(title)}</div>
           <div class="sub">${sch.enabled ? "Running" : "Paused"} \u00b7 source: ${this._esc(sch.source)}${
-            updated ? " \u00b7 optimized " + updated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : ""
+            updated ? " \u00b7 updated " + updated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : ""
           }</div>
         </div>
         <span class="chip ${st.tone}">${st.label}</span>

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any
 
@@ -112,14 +112,19 @@ def baseline_nodes(hass: HomeAssistant, options: dict[str, Any]) -> list[dict]:
     ]
 
 
+REFRESH = timedelta(minutes=15)
+
+
 class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Runs the optimizer on demand (button) and on a daily timer."""
+    """Runs the optimizer on demand (button), every REFRESH so the chart keeps up with
+    the clock, and on a daily timer (the only run that may auto-apply)."""
 
     config_entry: ConfigEntry
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, scheduler: Scheduler) -> None:
-        super().__init__(hass, _LOGGER, name=DOMAIN, config_entry=entry, update_interval=None)
+        super().__init__(hass, _LOGGER, name=DOMAIN, config_entry=entry, update_interval=REFRESH)
         self.scheduler = scheduler
+        self._last_error: str | None = None
 
     @property
     def climate_entity(self) -> str:
@@ -184,7 +189,10 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             result = await self._compute()
         except Exception as err:  # noqa: BLE001 - surface any failure as a status instead of failing setup
-            _LOGGER.warning("Optimizer run failed: %s", err)
+            # Log once per distinct failure, not on every refresh.
+            if str(err) != self._last_error:
+                _LOGGER.warning("Optimizer run failed: %s", err)
+            self._last_error = str(err)
             result = {
                 "status": "error",
                 "message": str(err),
@@ -310,6 +318,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except engine.ModelError as err:
             raise HomeAssistantError(str(err)) from err
         result["message"] = None
+        self._last_error = None
         return result
 
     def _sensor_points(self, states: list) -> list[tuple[float, float | None]]:

@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.4.0"
+CARD_VERSION = "0.4.0-beta.2"
 
 _LOGGER = logging.getLogger(__name__)
 

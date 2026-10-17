@@ -51,8 +51,9 @@ folder and restart.
    - Comfort limits: maximum temperature while awake and while asleep, and the hours.
    - **Your current schedule** (day and night temperatures and times). This is the baseline
      for the savings comparison and the starting schedule.
-   - When the optimizer runs each day (default 04:30) and how many days of history to learn
-     from (default 10, which matches the recorder default).
+   - When the daily run happens (default 04:30; this is the only run that can auto-apply) and
+     how many days of history to learn from (default 10, which matches the recorder default).
+     The chart and proposal also refresh every 15 minutes so "now" keeps up with the clock.
    - **Room temperature sensors** (optional, as many as you like). Each room learns how it runs
      compared with the thermostat, from outdoor temperature, sun and recent AC runtime. On the
      next page you pick when each room counts against the comfort limits: always, awake hours,
