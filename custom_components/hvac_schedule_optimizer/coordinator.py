@@ -16,6 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from . import engine
 from .const import (
@@ -30,6 +31,9 @@ from .const import (
     CONF_HISTORY_DAYS,
     CONF_HYSTERESIS,
     CONF_INDOOR_SENSOR,
+    CONF_OUTDOOR_SENSORS,
+    CONF_ROOM_SENSORS,
+    CONF_ROOM_WHEN,
     CONF_SLEEP_END,
     CONF_SLEEP_MAX,
     CONF_SLEEP_START,
@@ -141,7 +145,10 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not await recorder.async_db_ready:
             raise HomeAssistantError("The recorder database is not ready")
 
-        ids = [self.climate_entity] + ([sensor] if sensor else [])
+        o = {**default_options(settings.fahrenheit), **self.config_entry.options}
+        room_ids = [r for r in o[CONF_ROOM_SENSORS] if r != sensor]
+        outdoor_ids = list(o[CONF_OUTDOOR_SENSORS])
+        ids = list(dict.fromkeys([self.climate_entity] + ([sensor] if sensor else []) + room_ids + outdoor_ids))
         states = await recorder.async_add_executor_job(
             partial(
                 history.get_significant_states,
@@ -171,8 +178,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             on.append((ts, None if action in (None, "heating") else (1.0 if action == "cooling" else 0.0)))
             setp.append((ts, _num(a.get("temperature"))))
         if sensor:
-            for st in states.get(sensor, []):
-                indoor.append((st.last_updated.timestamp(), _num(st.state)))
+            indoor = self._sensor_points(states.get(sensor, []))
         for series in (indoor, on, setp):
             series.sort(key=lambda p: p[0])
 
@@ -203,6 +209,16 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             settings=settings,
             local_minutes_past=local_minutes_past,
             active_nodes=list(self.scheduler.nodes) if self.scheduler.nodes else None,
+            rooms=[
+                {
+                    "id": r,
+                    "name": (st.name if (st := self.hass.states.get(r)) else r),
+                    "when": o[CONF_ROOM_WHEN].get(r, "always"),
+                    "points": self._sensor_points(states.get(r, [])),
+                }
+                for r in room_ids
+            ],
+            outdoor=[p for r in outdoor_ids if (p := self._sensor_points(states.get(r, [])))],
         )
         try:
             result = await self.hass.async_add_executor_job(engine.run, inputs)
@@ -210,6 +226,19 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise HomeAssistantError(str(err)) from err
         result["message"] = None
         return result
+
+    def _sensor_points(self, states: list) -> list[tuple[float, float | None]]:
+        """Recorder states of a temperature sensor as sorted points in the Home Assistant unit."""
+        unit = self.hass.config.units.temperature_unit
+        out = []
+        for st in states:
+            v = _num(st.state)
+            src = st.attributes.get("unit_of_measurement")
+            if v is not None and src and src != unit and src in TemperatureConverter.VALID_UNITS:
+                v = TemperatureConverter.convert(v, src, unit)
+            out.append((st.last_updated.timestamp(), v))
+        out.sort(key=lambda p: p[0])
+        return out
 
     async def _fetch_weather(self, history_days: int) -> tuple[list, list, list]:
         fahrenheit = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT

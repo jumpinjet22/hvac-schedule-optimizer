@@ -24,6 +24,9 @@ CONF_BASE_SLEEP_HOUR = "baseline_sleep_hour"
 CONF_BASE_NIGHT_TEMP = "baseline_night_temp"
 CONF_RUN_TIME = "run_time"
 CONF_HISTORY_DAYS = "history_days"
+CONF_ROOM_SENSORS = "room_sensors"
+CONF_ROOM_WHEN = "room_when"
+CONF_OUTDOOR_SENSORS = "outdoor_sensors"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 STORAGE_VERSION = 1
@@ -46,4 +49,7 @@ def default_options(fahrenheit: bool) -> dict[str, Any]:
         CONF_BASE_NIGHT_TEMP: s.baseline[1][1],
         CONF_RUN_TIME: "04:30:00",
         CONF_HISTORY_DAYS: 10,
+        CONF_ROOM_SENSORS: [],
+        CONF_ROOM_WHEN: {},
+        CONF_OUTDOOR_SENSORS: [],
     }

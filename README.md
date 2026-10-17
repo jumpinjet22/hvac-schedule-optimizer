@@ -53,6 +53,16 @@ folder and restart.
      for the savings comparison and the starting schedule.
    - When the optimizer runs each day (default 04:30) and how many days of history to learn
      from (default 10, which matches the recorder default).
+   - **Room temperature sensors** (optional, as many as you like). Each room learns how it runs
+     compared with the thermostat, from outdoor temperature, sun and recent AC runtime. On the
+     next page you pick when each room counts against the comfort limits: always, awake hours,
+     sleep hours, or never (shown on the card only). A room needs about 3 days of readings, and
+     a model that tracks it closely, before it limits the schedule; until then the card marks it
+     "learning".
+   - **Outdoor temperature sensors** (optional, as many as you like). Their median replaces
+     Open-Meteo's past weather when learning, and the usual gap between your sensors and the
+     forecast at each hour of the day corrects the forecast. With three or more sensors, one
+     sitting in the sun is outvoted.
 3. **Turn off any other scheduler for this thermostat** (Climate Scheduler, automations that
    set the temperature on a timer) so they do not fight.
 

@@ -32,8 +32,28 @@
           "baseline_sleep_hour": "Current schedule: night starts (hour)",
           "baseline_night_temp": "Current schedule: night temperature",
           "run_time": "Daily optimizer run time",
-          "history_days": "Days of history to learn from"
+          "history_days": "Days of history to learn from",
+          "room_sensors": "Room temperature sensors",
+          "outdoor_sensors": "Outdoor temperature sensors"
+        },
+        "data_description": {
+          "room_sensors": "Any number of indoor sensors. Each room learns how it runs compared with the thermostat (about 3 days of readings), then you choose when it counts against the comfort limits on the next page.",
+          "outdoor_sensors": "Any number of outdoor sensors. Their median replaces Open-Meteo's past weather when learning, and corrects the forecast for your spot. One sensor in direct sun is outvoted when you have three or more."
         }
+      },
+      "rooms": {
+        "title": "When each room counts",
+        "description": "Choose when each room's temperature has to stay under the comfort limits: always, only during awake hours, only during sleep hours, or never (shown on the card only). The thermostat itself always counts.\n\n{names}"
+      }
+    }
+  },
+  "selector": {
+    "room_when": {
+      "options": {
+        "always": "Always",
+        "awake": "Awake hours",
+        "asleep": "Sleep hours",
+        "never": "Never (watch only)"
       }
     }
   }

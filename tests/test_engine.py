@@ -205,3 +205,87 @@ def test_runtime_prediction():
     assert abs(p["hours"] - res["best"]["ac_hours"]) < 0.02
     assert len(p["minutes_per_hour"]) == 24 and sum(p["minutes_per_hour"]) / 60 - p["hours"] < 0.02
     assert p["cycles"] >= 1 and 0 < p["longest_min"] <= 24 * 60
+
+
+def _room_points(inp, truth_offset, sun_coef, ac_coef, noise=0.05, seed=3, days=None):
+    """A room that tracks the thermostat with a known offset, sun gain and AC pull."""
+    rng = random.Random(seed)
+    Ti = engine.resample(inp.indoor, inp.g0, inp.n_hist, inp.data_end)
+    on = engine.resample(inp.on, inp.g0, inp.n_hist, inp.data_end)
+    first = inp.n_hist - days * 96 if days else 0
+    pts = []
+    for i in range(first, inp.n_hist):
+        t = inp.g0 + i * STEP
+        duty = engine._duty(on, i) if i > 0 else on[0]
+        v = Ti[i] + truth_offset + sun_coef * _weather(t)[1] / 1000.0 + ac_coef * duty + rng.gauss(0, noise)
+        pts.append((t, v))
+    return pts
+
+
+def test_room_model_learns_offset():
+    inp, _ = _synthetic()
+    inp.rooms = [{"id": "sensor.bedroom", "name": "Bedroom", "when": "never", "points": _room_points(inp, 2.0, 1.5, -1.0)}]
+    res = engine.run(inp)
+    room = res["rooms"][0]
+    assert room["trusted"] and not room["limits_search"]
+    assert abs(room["coef"]["offset"] - 2.0) < 0.4
+    assert abs(room["coef"]["sun"] - 1.5) < 0.5
+    assert abs(room["coef"]["ac"] + 1.0) < 0.4
+    sr = res["series"]["rooms"][0]
+    assert len(sr["actual"]) == 192 and len(sr["predicted"]["proposed"]) == 192
+
+
+def test_warm_bedroom_tightens_night_schedule():
+    inp, _ = _synthetic()
+    plain = engine.run(inp)
+    inp.rooms = [{"id": "sensor.bedroom", "name": "Bedroom", "when": "asleep", "points": _room_points(inp, 1.5, 0.0, 0.0)}]
+    res = engine.run(inp)
+    room = res["rooms"][0]
+    assert room["limits_search"]
+    best = res["best"] or res["closest"]
+    night_plain = min(n["temp"] for n in plain["best"]["nodes"])
+    night_room = min(n["temp"] for n in best["nodes"])
+    assert night_room < night_plain  # has to run colder so the bedroom stays under the sleep limit
+    if res["best"]:
+        s = res["series"]
+        lm = s["local_minutes"]
+        pred = s["rooms"][0]["predicted"]["proposed"]
+        for i in range(s["now_index"], len(lm) - 1):
+            h = lm[i] // 60
+            if h >= inp.settings.sleep_start or h < inp.settings.sleep_end:
+                assert pred[i + 1] <= inp.settings.sleep_max + 0.06  # limits apply at the end of each bin
+
+
+def test_new_room_is_shown_but_does_not_limit():
+    inp, _ = _synthetic()
+    inp.rooms = [{"id": "sensor.office", "name": "Office", "when": "always", "points": _room_points(inp, 5.0, 0, 0, days=1)}]
+    res = engine.run(inp)
+    room = res["rooms"][0]
+    assert not room["trusted"] and not room["limits_search"]
+    assert room["reason"].startswith("Learning")
+    assert res["status"] == "ready"
+
+
+def test_outdoor_sensors_median_and_forecast_bias():
+    inp, _ = _synthetic()
+    ts = [inp.g0 + i * STEP for i in range(inp.n_hist)]
+    good = [(t, _weather(t)[0] + 3.0) for t in ts]
+    good2 = [(t, _weather(t)[0] + 3.2) for t in ts]
+    sunny = [(t, _weather(t)[0] + 15.0) for t in ts]  # sensor in direct sun, the median ignores it
+    inp.outdoor = [good, good2, sunny]
+    res = engine.run(inp)
+    info = res["outdoor_sensors"]
+    assert info["sensors"] == 3 and info["history_coverage"] > 0.95
+    assert all(abs(b - 3.2) < 0.3 for b in info["forecast_bias_by_hour"])
+    s = res["series"]
+    now = s["now_index"]
+    fc_time = s["start"] + now * STEP + 6 * 3600
+    i = now + 24
+    assert abs(s["outdoor"][i] - (_weather(fc_time)[0] + 3.2)) < 0.5
+
+
+def test_no_extra_sensors_matches_previous_behavior():
+    inp, _ = _synthetic()
+    res = engine.run(inp)
+    assert res["rooms"] == [] and res["outdoor_sensors"] is None
+    assert res["series"]["rooms"] == []

@@ -46,6 +46,8 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
             "comfortable_candidates": _data(c).get("comfortable"),
             "model": _data(c).get("model"),
             "validation": _data(c).get("validation"),
+            "rooms": _data(c).get("rooms"),
+            "outdoor_sensors": _data(c).get("outdoor_sensors"),
             "start_temp": _data(c).get("start_temp"),
             "horizon_hours": _data(c).get("horizon_hours"),
         },

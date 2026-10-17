@@ -6,10 +6,12 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.2.2";
+const CARD_VERSION = "0.3.0";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
+const ROOM_COLORS = ["#ab47bc", "#26a69a", "#ef6c00", "#5c6bc0", "#ec407a", "#9e9d24", "#8d6e63", "#29b6f6"];
+const ROOM_WHEN = { always: "always", awake: "awake hours", asleep: "sleep hours", never: "watch only" };
 
 const STATUS = {
   ready: { label: "Ready", tone: "good" },
@@ -346,6 +348,10 @@ class HvacScheduleCard extends HTMLElement {
       `<span><i style="border-color:var(--hso-muted)"></i>${hasActive ? "Active" : "Baseline"} setpoint</span>`,
       `<span><i class="dash" style="border-color:var(--hso-accent)"></i>Proposed setpoint</span>`,
       `<span><i class="box" style="background:var(--hso-cool)"></i>AC running</span>`,
+      ...(r.series.rooms || []).map((room, k) => {
+        const tag = room.trusted ? ROOM_WHEN[room.when] || room.when : "learning";
+        return `<span title="${this._esc(tag)}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
+      }),
     ].join("");
   }
 
@@ -376,8 +382,11 @@ class HvacScheduleCard extends HTMLElement {
     });
 
     // indoor scale (left)
+    const rooms = s.rooms || [];
+    const roomFuture = (room) => room.predicted.proposed || room.predicted.active || room.predicted.baseline || [];
     const ivals = [].concat(
-      s.indoor_actual, s.indoor.proposed || [], s.indoor.active || s.indoor.baseline || [], refSp, propSp || [], limit
+      s.indoor_actual, s.indoor.proposed || [], s.indoor.active || s.indoor.baseline || [], refSp, propSp || [], limit,
+      ...rooms.map((room) => room.actual.concat(roomFuture(room)))
     ).filter((v) => v !== null && v !== undefined);
     let imin = Math.min(...ivals) - 0.8, imax = Math.max(...ivals) + 0.8;
     if (imax - imin < 4) { const mid = (imax + imin) / 2; imin = mid - 2; imax = mid + 2; }
@@ -440,6 +449,13 @@ class HvacScheduleCard extends HTMLElement {
     if (baseSp) this._line(svg, baseSp, X, Yi, { stroke: "currentColor", "stroke-opacity": 0.35, "stroke-width": 1.4 }, true);
     if (propSp) this._line(svg, propSp, X, Yi, { stroke: "var(--hso-accent, #03a9f4)", "stroke-width": 2, "stroke-dasharray": "6 4" }, true);
 
+    // rooms: actual (past) solid, predicted (future, under the proposal when there is one) dashed
+    rooms.forEach((room, k) => {
+      const col = ROOM_COLORS[k % ROOM_COLORS.length];
+      this._line(svg, room.actual, X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": 0.85 }, false);
+      this._line(svg, roomFuture(room), X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": room.trusted ? 0.85 : 0.4, "stroke-dasharray": "4 3" }, false);
+    });
+
     // indoor: actual (past) solid, predicted (future) under each schedule
     const ia = s.indoor_actual;
     this._line(svg, ia, X, Yi, { stroke: "var(--primary-text-color, #212121)", "stroke-width": 2.2 }, false);
@@ -480,6 +496,10 @@ class HvacScheduleCard extends HTMLElement {
         [future ? "Indoor (active)" : "Indoor", `${f1(future ? (s.indoor.active || s.indoor.baseline || [])[i] : ia[i])}${unit}`],
       ];
       if (future && s.indoor.proposed) rows.push(["Indoor (proposed)", `${f1(s.indoor.proposed[i])}${unit}`]);
+      rooms.forEach((room) => {
+        const v = future ? roomFuture(room)[i] : room.actual[i];
+        if (v !== null && v !== undefined) rows.push([room.name, `${f1(v)}${unit}`]);
+      });
       rows.push(["Setpoint", `${f1(refSp[i])}${unit}`]);
       if (propSp) rows.push(["Proposed", `${f1(propSp[i])}${unit}`]);
       const ac = future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i];
