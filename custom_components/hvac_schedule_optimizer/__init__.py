@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 
 import voluptuous as vol
@@ -24,7 +25,9 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.2.1"
+CARD_VERSION = "0.2.2"
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
 
@@ -73,7 +76,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     card = Path(__file__).parent / "frontend" / CARD_FILE
     await hass.http.async_register_static_paths([StaticPathConfig(CARD_URL, str(card), False)])
     add_extra_js_url(hass, f"{CARD_URL}?v={CARD_VERSION}")
+    # Also list it as a dashboard resource. Dashboards wait for resources before building cards,
+    # while extra JS can land after them (the companion app often hits that race on resume).
+    await _async_register_resource(hass, f"{CARD_URL}?v={CARD_VERSION}")
     return True
+
+
+async def _async_register_resource(hass: HomeAssistant, url: str) -> None:
+    """Add or update the card in the Lovelace resources (storage mode only)."""
+    data = hass.data.get("lovelace")
+    resources = data.get("resources") if isinstance(data, dict) else getattr(data, "resources", None)
+    if resources is None or not hasattr(resources, "async_create_item"):
+        return  # YAML mode: the user manages resources, extra JS still loads the card
+    try:
+        if not resources.loaded:
+            await resources.async_load()
+            resources.loaded = True
+        for item in resources.async_items():
+            if item["url"].split("?")[0] == CARD_URL:
+                if item["url"] != url:
+                    await resources.async_update_item(item["id"], {"res_type": "module", "url": url})
+                return
+        await resources.async_create_item({"res_type": "module", "url": url})
+    except Exception:  # noqa: BLE001 - never block setup over the card
+        _LOGGER.warning("Could not add the HVAC Schedule card to dashboard resources", exc_info=True)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) -> bool:
