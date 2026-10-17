@@ -29,8 +29,15 @@ from .const import (
     CONF_BASE_NIGHT_TEMP,
     CONF_BASE_SLEEP_HOUR,
     CONF_BASE_WAKE_HOUR,
+    CONF_AC_KW,
     CONF_CLIMATE,
+    CONF_FAN_CONTROL,
+    CONF_FAN_HUMIDITY_MAX,
+    CONF_FAN_MODE_CIRCULATE,
+    CONF_FAN_MODE_NORMAL,
+    CONF_FAN_WATTS,
     CONF_HISTORY_DAYS,
+    CONF_HUMIDITY_SENSOR,
     CONF_HYSTERESIS,
     CONF_INDOOR_SENSOR,
     CONF_OUTDOOR_SENSORS,
@@ -42,6 +49,8 @@ from .const import (
     DOMAIN,
     OPEN_METEO_URL,
     default_options,
+    guess_fan_modes,
+    thermostat_fan_modes,
 )
 from .scheduler import Scheduler
 
@@ -135,7 +144,35 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         step = _num(climate_state.attributes.get("target_temp_step"))
         if step and step > 0:
             s.step = step
+        s.fan_enabled = self.fan_config(climate_state) is not None
+        s.fan_kw = float(o[CONF_FAN_WATTS]) / 1000.0
+        s.ac_kw = float(o[CONF_AC_KW])
         return s
+
+    def fan_config(self, climate_state=None) -> tuple[str, str] | None:
+        """(normal, circulate) when fan control is on and both modes still exist on the thermostat."""
+        o = self.config_entry.options
+        state = climate_state or self.hass.states.get(self.climate_entity)
+        modes = thermostat_fan_modes(state)
+        normal, circ = o.get(CONF_FAN_MODE_NORMAL), o.get(CONF_FAN_MODE_CIRCULATE)
+        if not o.get(CONF_FAN_CONTROL) or normal not in modes or circ not in modes or normal == circ:
+            return None
+        return normal, circ
+
+    def fan_blocked(self) -> str | None:
+        """Why the fan should not circulate right now, or None."""
+        f = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
+        o = {**default_options(f), **self.config_entry.options}
+        limit = float(o[CONF_FAN_HUMIDITY_MAX])
+        sensor = o.get(CONF_HUMIDITY_SENSOR)
+        humidity = None
+        if sensor and (st := self.hass.states.get(sensor)):
+            humidity = _num(st.state)
+        if humidity is None and (st := self.hass.states.get(self.climate_entity)):
+            humidity = _num(st.attributes.get("current_humidity"))
+        if humidity is not None and humidity > limit:
+            return f"Indoor humidity {humidity:.0f}% is over the {limit:.0f}% fan limit"
+        return None
 
     def _history_days(self) -> int:
         f = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
@@ -202,13 +239,16 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         )
 
-        indoor, on, setp = [], [], []
+        modes = thermostat_fan_modes(state)
+        circ_mode = (self.fan_config(state) or (None, guess_fan_modes(modes)[1] if modes else None))[1]
+        indoor, on, setp, fan = [], [], [], []
         for st in states.get(self.climate_entity, []):
             ts = st.last_updated.timestamp()
             if st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 indoor.append((ts, None))
                 on.append((ts, None))
                 setp.append((ts, None))
+                fan.append((ts, None))
                 continue
             a = st.attributes
             if not sensor:
@@ -216,6 +256,10 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             action = a.get("hvac_action")
             on.append((ts, None if action in (None, "heating") else (1.0 if action == "cooling" else 0.0)))
             setp.append((ts, _num(a.get("temperature"))))
+            if modes:
+                fm = a.get("fan_mode")
+                forced = action == "fan" or (circ_mode is not None and fm == circ_mode)
+                fan.append((ts, 1.0 if forced else (0.0 if fm is not None or action is not None else None)))
         if sensor:
             indoor = self._sensor_points(states.get(sensor, []))
         for series in (indoor, on, setp):
@@ -258,6 +302,8 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for r in room_ids
             ],
             outdoor=[p for r in outdoor_ids if (p := self._sensor_points(states.get(r, [])))],
+            fan=sorted(fan, key=lambda p: p[0]),
+            fan_blocked=self.fan_blocked() if settings.fan_enabled else None,
         )
         try:
             result = await self.hass.async_add_executor_job(engine.run, inputs)

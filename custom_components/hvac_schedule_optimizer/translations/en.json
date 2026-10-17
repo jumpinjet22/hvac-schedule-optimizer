@@ -44,7 +44,28 @@
       "rooms": {
         "title": "When each room counts",
         "description": "Choose when each room's temperature has to stay under the comfort limits: always, only during awake hours, only during sleep hours, or never (shown on the card only). The thermostat itself always counts.\n\n{names}"
+      },
+      "fan": {
+        "title": "Fan",
+        "description": "Your thermostat reports these fan modes: {modes}.\n\nWith fan control on, the optimizer can circulate the blower to even out rooms, but only once a room has learned what the fan does (about 4 hours of fan-only running in history) and only when it costs less than cooling the whole house harder. The fan always goes back to the normal mode when a fan window ends, when you pause the schedule, and when the integration unloads.",
+        "data": {
+          "fan_control": "Let the optimizer use the fan",
+          "fan_mode_normal": "Normal mode (blower runs only with cooling)",
+          "fan_mode_circulate": "Circulate mode (blower runs on its own)",
+          "fan_watts": "Blower power on circulate (W)",
+          "ac_kw": "AC power while cooling (kW)",
+          "fan_humidity_max": "Do not circulate above this indoor humidity (%)",
+          "humidity_sensor": "Indoor humidity sensor (optional)"
+        },
+        "data_description": {
+          "fan_watts": "Variable speed blowers on circulate often draw 50 to 150 W; older single speed blowers 300 to 500 W.",
+          "ac_kw": "Roughly 1 kW per ton of cooling. Used only to weigh blower time against AC time.",
+          "humidity_sensor": "If empty, the thermostat's own humidity reading is used when it has one. Circulating right after cooling can blow moisture off the coil back into the house."
+        }
       }
+    },
+    "error": {
+      "same_fan_mode": "Normal and circulate have to be different fan modes."
     }
   },
   "selector": {

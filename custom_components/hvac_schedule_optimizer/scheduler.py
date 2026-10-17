@@ -25,6 +25,11 @@ class Scheduler:
 
     It only writes at node transitions (and once when it starts or is enabled),
     so a manual change at the thermostat sticks until the next node.
+
+    Fan: when fan control is configured, a node with fan=True switches the
+    thermostat to the circulate mode until the next node. The fan is only
+    touched while the schedule uses it (or this scheduler switched it), and it
+    goes back to the normal mode on pause and unload.
     """
 
     def __init__(self, hass: HomeAssistant, entry_id: str, climate_entity: str, default_nodes: list[dict]) -> None:
@@ -41,6 +46,11 @@ class Scheduler:
         self.last_set: dict[str, Any] | None = None
         self._unsub: CALLBACK_TYPE | None = None
         self._listeners: list[Callable[[], None]] = []
+        # Set by the integration: (normal, circulate) mode names or None, and a humidity guard.
+        self.fan_config: Callable[[], tuple[str, str] | None] = lambda: None
+        self.fan_blocked: Callable[[], str | None] = lambda: None
+        self.fan_forced = False
+        self.fan_note: str | None = None
 
     # ---------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -54,6 +64,7 @@ class Scheduler:
         self.enabled = bool(data.get("enabled", False))
         self.auto_apply = bool(data.get("auto_apply", False))
         self.last_set = data.get("last_set")
+        self.fan_forced = bool(data.get("fan_forced", False))
 
     async def _async_save(self) -> None:
         await self._store.async_save(
@@ -65,6 +76,7 @@ class Scheduler:
                 "enabled": self.enabled,
                 "auto_apply": self.auto_apply,
                 "last_set": self.last_set,
+                "fan_forced": self.fan_forced,
             }
         )
 
@@ -105,6 +117,7 @@ class Scheduler:
             self._arm()
         else:
             self.async_stop()
+            await self.async_release_fan()
         self._notify()
 
     async def async_set_auto_apply(self, value: bool) -> None:
@@ -116,7 +129,10 @@ class Scheduler:
     async def async_set_nodes(self, nodes: list[dict], source: str) -> None:
         """Replace the active schedule. The old one is kept for one-tap revert."""
         engine.parse_nodes(nodes)  # validates
-        clean = [{"time": engine.hhmm(engine.to_minutes(n["time"])), "temp": n["temp"]} for n in nodes]
+        clean = [
+            {"time": engine.hhmm(engine.to_minutes(n["time"])), "temp": n["temp"], **({"fan": True} if n.get("fan") else {})}
+            for n in nodes
+        ]
         clean.sort(key=lambda n: engine.to_minutes(n["time"]))
         if clean != self.nodes:
             self.previous = self.nodes
@@ -167,6 +183,9 @@ class Scheduler:
             "next_change": when.isoformat(),
             "next_temp": temp,
             "climate_entity": self.climate_entity,
+            "fan_now": self.fan_forced,
+            "fan_control": self.fan_config() is not None,
+            "fan_note": self.fan_note,
         }
 
     @callback
@@ -191,6 +210,7 @@ class Scheduler:
         if state.state != "cool":
             _LOGGER.debug("%s is in mode %s, not cool; leaving it alone", self.climate_entity, state.state)
             return
+        await self._async_apply_fan(state, now)
         temp = self.current_setpoint(now)
         lo, hi = state.attributes.get("min_temp"), state.attributes.get("max_temp")
         if lo is not None:
@@ -212,3 +232,39 @@ class Scheduler:
             return
         self.last_set = {"temp": temp, "at": dt_util.utcnow().isoformat(), "changed": True}
         await self._async_save()
+
+    async def _async_apply_fan(self, state, now: datetime | None = None) -> None:
+        cfg = self.fan_config()
+        uses_fan = any(n.get("fan") for n in self.nodes)
+        if cfg is None or not (uses_fan or self.fan_forced):
+            self.fan_note = None
+            return
+        normal, circ = cfg
+        local = dt_util.as_local(now or dt_util.now())
+        want = uses_fan and engine.fan_at(self.nodes, local.hour * 60 + local.minute)
+        self.fan_note = None
+        if want and (blocked := self.fan_blocked()):
+            self.fan_note = blocked
+            want = False
+        await self._async_set_fan(state, circ if want else normal, want)
+
+    async def _async_set_fan(self, state, mode: str, forced: bool) -> None:
+        if state.attributes.get("fan_mode") != mode:
+            try:
+                await self.hass.services.async_call(
+                    "climate", "set_fan_mode", {"entity_id": self.climate_entity, "fan_mode": mode}, blocking=True
+                )
+            except HomeAssistantError as err:
+                _LOGGER.warning("Could not set %s fan to %s: %s", self.climate_entity, mode, err)
+                return
+        if forced != self.fan_forced:
+            self.fan_forced = forced
+            await self._async_save()
+
+    async def async_release_fan(self) -> None:
+        """Put the fan back to the normal mode if this scheduler switched it to circulate."""
+        cfg = self.fan_config()
+        state = self.hass.states.get(self.climate_entity)
+        if not self.fan_forced or cfg is None or state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+        await self._async_set_fan(state, cfg[0], False)

@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.3.0"
+CARD_VERSION = "0.4.0"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ _NODE = vol.Schema(
     {
         vol.Required("time"): vol.All(cv.time, lambda t: t.strftime("%H:%M")),
         vol.Required("temp"): vol.Coerce(float),
+        vol.Optional("fan", default=False): cv.boolean,
     }
 )
 _SET_SCHEDULE = vol.Schema(
@@ -106,6 +107,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
     scheduler = Scheduler(hass, entry.entry_id, entry.data[CONF_CLIMATE], baseline_nodes(hass, entry.options))
     await scheduler.async_load()
     coordinator = OptimizerCoordinator(hass, entry, scheduler)
+    scheduler.fan_config = coordinator.fan_config
+    scheduler.fan_blocked = coordinator.fan_blocked
     entry.runtime_data = RuntimeData(coordinator, scheduler)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -129,6 +132,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) -> bool:
+    await entry.runtime_data.scheduler.async_release_fan()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

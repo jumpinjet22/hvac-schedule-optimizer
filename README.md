@@ -63,7 +63,19 @@ folder and restart.
      Open-Meteo's past weather when learning, and the usual gap between your sensors and the
      forecast at each hour of the day corrects the forecast. With three or more sensors, one
      sitting in the sun is outvoted.
-3. **Turn off any other scheduler for this thermostat** (Climate Scheduler, automations that
+   - **Fan** (only shown when your thermostat reports fan modes). Turn on fan control and pick
+     which of your thermostat's own modes is *normal* (blower runs with cooling only) and which
+     is *circulate* (blower runs on its own). The integration guesses both from the mode names.
+     Also set the blower's power on circulate, the AC's power, and a humidity limit above which
+     it will not circulate.
+3. How the fan is used: every room learns how much the blower running on its own evens it out,
+   once the history holds about 4 hours of fan-only running. The optimizer then tries short
+   circulate windows (around bedtime, overnight, late afternoon, all day) only for schedules that
+   fail because of a room, and keeps one only if it costs less than cooling the whole house
+   harder. A schedule node with `fan: true` circulates until the next node. The fan always goes
+   back to the normal mode when a window ends, when the schedule is paused, and when the
+   integration unloads, and it is never touched while the schedule has no fan nodes.
+4. **Turn off any other scheduler for this thermostat** (Climate Scheduler, automations that
    set the temperature on a timer) so they do not fight.
 
 ## Entities

@@ -18,10 +18,16 @@ candidate daily schedules against the forecast.
 Rooms (optional): each extra indoor sensor gets a static offset model against
 the thermostat reading,
 
-    Troom - Tin = a + b * (Tout - Tin) + c * Sun/1000 + d * AC_recent
+    Troom - Tin = a + b * (Tout - Tin) + c * Sun/1000 + d * AC_recent + e * Fan_recent
 
-where AC_recent is the AC duty over the last hour. Trusted rooms add their own
+where AC_recent is the AC duty over the last hour and Fan_recent the share of
+the last hour the blower ran without the AC (circulate). The fan term is only
+fitted once the history holds enough fan-only time. Trusted rooms add their own
 comfort limits to the search.
+
+Fan (optional): schedule nodes can carry fan=True to circulate until the next
+node. Fan windows are only tried for schedules that fail because of a room, and
+blower energy is charged at fan_kw / ac_kw of an AC hour.
 
 Outdoor sensors (optional): their median replaces the Open-Meteo past weather
 for the fit, and the average sensor-minus-forecast gap for each local hour
@@ -66,6 +72,10 @@ class Settings:
     min_room_rows: int = 288  # about 3 days of 15 minute bins
     room_rmse_max: float = 1.5  # a room model worse than this is shown but does not limit the search
     max_outdoor_bias: float = 10.0
+    fan_enabled: bool = False
+    fan_kw: float = 0.4
+    ac_kw: float = 3.5
+    min_fan_bins: int = 16  # 4 hours of fan-only running before a room's fan effect is fitted
 
     @classmethod
     def defaults(cls, fahrenheit: bool = True) -> "Settings":
@@ -103,6 +113,8 @@ class Inputs:
     active_nodes: list | None = None  # schedule currently running, [{"time","temp"}]
     rooms: list = field(default_factory=list)  # [{"id","name","when","points": [(epoch, temp or None)]}]
     outdoor: list = field(default_factory=list)  # one [(epoch, temp or None)] list per outdoor sensor
+    fan: list = field(default_factory=list)  # [(epoch, 1.0 blower forced on / 0.0 not / None unknown)]
+    fan_blocked: str | None = None  # why fan windows are off for this run (humidity, ...)
 
 
 # ------------------------------------------------------------------ helpers
@@ -206,6 +218,39 @@ def setpoint_at(nodes: list, minute: int) -> float:
     parsed = parse_nodes(nodes)
     mins = [p[0] for p in parsed]
     return parsed[bisect_right(mins, minute) - 1][1]
+
+
+def fan_at(nodes: list, minute: int) -> bool:
+    """Whether the node active at a local minute-of-day asks for the fan to circulate."""
+    ordered = sorted(nodes, key=lambda n: to_minutes(n["time"]))
+    mins = [to_minutes(n["time"]) for n in ordered]
+    return bool(ordered[bisect_right(mins, minute) - 1].get("fan"))
+
+
+def fan_plan(nodes: list) -> list[tuple[int, bool]]:
+    """[{"time","temp","fan"?}] -> sorted [(minute_of_day, fan)]."""
+    return sorted((to_minutes(n["time"]), bool(n.get("fan"))) for n in nodes)
+
+
+def _step_at(plan: list, minute: int):
+    mins = [p[0] for p in plan]
+    return plan[bisect_right(mins, minute) - 1][1]
+
+
+def merge_plan(nodes: list, fan: list | None) -> list[tuple[int, float, bool]]:
+    """Combine setpoint nodes and fan steps into one list of (minute, temp, fan), dropping repeats."""
+    if not fan:
+        return [(m, t, False) for m, t in nodes]
+    times = sorted({m for m, _ in nodes} | {m for m, _ in fan})
+    out = []
+    for m in times:
+        step = (m, _step_at(nodes, m), bool(_step_at(fan, m)))
+        if out and out[-1][1:] == step[1:]:
+            continue
+        out.append(step)
+    if len(out) > 1 and out[0][1:] == out[-1][1:]:
+        out.pop(0)  # the overnight node already carries the first state
+    return out
 
 
 def next_change(nodes: list, minute: int) -> tuple[int, float]:
@@ -314,33 +359,47 @@ ROOM_WHEN = ("always", "awake", "asleep", "never")
 
 
 def _duty(on: list, i: int) -> float | None:
-    """AC duty over the hour before Ti index i (bins i-4 .. i-1)."""
+    """Duty of a 0/1 series over the hour before Ti index i (bins i-4 .. i-1)."""
     vals = [v for v in on[max(0, i - 4) : i] if v is not None]
     return sum(vals) / len(vals) if vals else None
 
 
-def fit_room(R: list, Ti: list, To: list, S: list, on: list, s: Settings) -> dict:
+def fan_only(fan: list, on: list) -> list:
+    """Blower running without the AC, per bin."""
+    return [None if f is None or o is None else f * (1.0 - o) for f, o in zip(fan, on)]
+
+
+def fit_room(R: list, Ti: list, To: list, S: list, on: list, s: Settings, fo: list | None = None) -> dict:
     """Least squares fit of the room offset against the thermostat reading."""
+    fan_bins = sum(1 for v in fo or [] if v is not None and v > 0.5)
+    use_fan = fan_bins >= s.min_fan_bins
+    nf = 5 if use_fan else 4
     rows = []
     for i in range(len(R)):
         r, t, o, sun = R[i], Ti[i], To[i], S[i]
         d = _duty(on, i) if i > 0 else on[0]
         if r is None or t is None or o is None or sun is None or d is None:
             continue
-        rows.append(((1.0, o - t, sun / 1000.0, d), r - t))
-    out = {"rows": len(rows), "coef": None, "rmse": None, "r2": None, "trusted": False}
+        x = [1.0, o - t, sun / 1000.0, d]
+        if use_fan:
+            f = _duty(fo, i) if i > 0 else fo[0]
+            if f is None:
+                continue
+            x.append(f)
+        rows.append((x, r - t))
+    out = {"rows": len(rows), "coef": None, "rmse": None, "r2": None, "trusted": False, "fan_learned": False}
     if len(rows) < s.min_room_rows:
         out["reason"] = f"Learning: {len(rows)} of {s.min_room_rows} readings"
         return out
     lam = 1e-3 * len(rows)  # light ridge so a feature that never moves (no sun at night) cannot blow up
-    XtX = [[0.0] * 4 for _ in range(4)]
-    Xty = [0.0] * 4
+    XtX = [[0.0] * nf for _ in range(nf)]
+    Xty = [0.0] * nf
     for x, y in rows:
-        for i in range(4):
+        for i in range(nf):
             Xty[i] += x[i] * y
-            for j in range(4):
+            for j in range(nf):
                 XtX[i][j] += x[i] * x[j]
-    for i in range(1, 4):
+    for i in range(1, nf):
         XtX[i][i] += lam
     try:
         beta = _solve(XtX, Xty)
@@ -350,7 +409,8 @@ def fit_room(R: list, Ti: list, To: list, S: list, on: list, s: Settings) -> dic
     ybar = sum(y for _, y in rows) / len(rows)
     ss_res = sum((y - sum(b * v for b, v in zip(beta, x))) ** 2 for x, y in rows)
     ss_tot = sum((y - ybar) ** 2 for _, y in rows)
-    out["coef"] = beta
+    out["coef"] = beta + [0.0] * (5 - nf)
+    out["fan_learned"] = use_fan
     out["rmse"] = math.sqrt(ss_res / len(rows))
     out["r2"] = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     out["trusted"] = out["rmse"] <= s.room_rmse_max
@@ -358,15 +418,16 @@ def fit_room(R: list, Ti: list, To: list, S: list, on: list, s: Settings) -> dic
     return out
 
 
-def room_trace(coef: list, Ti: list, on: list, To: list, S: list, on0: int) -> list:
+def room_trace(coef: list, Ti: list, on: list, To: list, S: list, on0: int, fo: list | None = None, fo0: float = 0.0) -> list:
     """Predicted room temperature for each Ti index (Ti has one more element than on/To/S)."""
-    a, b, c, d = coef
+    a, b, c, d, e = coef
     n = len(To)
     out = []
     for i, t in enumerate(Ti):
         j = min(i, n - 1)
         duty = _duty(on, i) if i > 0 else float(on0)
-        out.append(t + a + b * (To[j] - t) + c * S[j] / 1000.0 + d * duty)
+        fd = (_duty(fo, i) if i > 0 else fo0) if fo else 0.0
+        out.append(t + a + b * (To[j] - t) + c * S[j] / 1000.0 + d * duty + e * (fd or 0.0))
     return out
 
 
@@ -433,7 +494,10 @@ def make_ctx(To_h: list, S_h: list, local_minutes: list, s: Settings, rooms: lis
     return {"To": To_h, "S": S_h, "lm": local_minutes, "awake": awake, "sleep": sleep, "rooms": rooms or []}
 
 
-def evaluate(m: dict, nodes: list, ctx: dict, ti0: float, on0: int, s: Settings, keep: bool = False) -> dict:
+def evaluate(
+    m: dict, nodes: list, ctx: dict, ti0: float, on0: int, s: Settings, keep: bool = False, fan: list | None = None
+) -> dict:
+    """fan: [(minute, bool)] steps, the blower circulates while the active step is True."""
     mins = [x[0] for x in nodes]
     temps = [x[1] for x in nodes]
     sp = [temps[bisect_right(mins, x) - 1] for x in ctx["lm"]]  # index -1 wraps to last node (overnight)
@@ -441,27 +505,58 @@ def evaluate(m: dict, nodes: list, ctx: dict, ti0: float, on0: int, s: Settings,
     energy = sum(
         o * STEP_H * max(0.5, 1 + s.energy_temp_coef * (t - s.ref_outdoor)) for o, t in zip(on, ctx["To"])
     )
+    fan_bins = [1.0 if _step_at(fan, x) else 0.0 for x in ctx["lm"]] if fan else None
+    fo = fan_only(fan_bins, on) if fan_bins else None
+    if fo:
+        energy += sum(fo) * STEP_H * s.fan_kw / s.ac_kw
     va = max((Ti[i] - s.awake_max for i in ctx["awake"]), default=-99.0)
     vs = max((Ti[i] - s.sleep_max for i in ctx["sleep"]), default=-99.0)
+    house = max(0.0, va, vs)
     for room in ctx["rooms"]:
-        Tr = room_trace(room["coef"], Ti, on, ctx["To"], ctx["S"], on0)
+        Tr = room_trace(room["coef"], Ti, on, ctx["To"], ctx["S"], on0, fo, ctx.get("fo0", 0.0))
         if room["when"] in ("always", "awake"):
             va = max(va, max((Tr[i] - s.awake_max for i in ctx["awake"]), default=-99.0))
         if room["when"] in ("always", "asleep"):
             vs = max(vs, max((Tr[i] - s.sleep_max for i in ctx["sleep"]), default=-99.0))
     out = {
         "nodes": nodes,
+        "fan": fan,
         "energy": energy,
         "hours": sum(on) * STEP_H,
+        "fan_hours": sum(fo) * STEP_H if fo else 0.0,
         "tmin": min(Ti),
         "tmax": max(Ti),
         "viol": max(0.0, va, vs),
-        "score": energy + s.simplicity_penalty * (len(nodes) - 2),
+        "viol_house": house,
+        "score": energy + s.simplicity_penalty * (len(merge_plan(nodes, fan)) - 2),
     }
     if keep:
         out["Ti"] = Ti[:-1]  # one value per forecast bin
         out["on"] = on
         out["Tfull"] = Ti
+        out["fo"] = fo
+        out["fan_bins"] = fan_bins
+    return out
+
+
+def fan_options(s: Settings) -> list:
+    """Circulate windows to try, as [(minute, bool)] steps."""
+    def win(a, b):
+        return [((a % 24) * 60, True), ((b % 24) * 60, False)]
+
+    # Windows open an hour early: a room feels the fan over the following hour, not at once.
+    opts = [
+        win(s.sleep_start - 1, s.sleep_end),
+        win(s.sleep_start - 1, s.sleep_start + 2),
+        win(s.sleep_start - 2, s.sleep_start),
+        win(s.awake_end - 3, s.awake_end),
+        win(s.awake_start - 1, s.awake_end),
+    ]
+    seen, out = set(), []
+    for o in opts:
+        if o[0][0] != o[1][0] and tuple(o) not in seen:
+            seen.add(tuple(o))
+            out.append(sorted(o))
     return out
 
 
@@ -469,8 +564,12 @@ def _pack(r: dict | None) -> dict | None:
     if r is None:
         return None
     return {
-        "nodes": [{"time": hhmm(mn), "temp": _fmt_temp(t)} for mn, t in r["nodes"]],
+        "nodes": [
+            {"time": hhmm(mn), "temp": _fmt_temp(t), **({"fan": True} if f else {})}
+            for mn, t, f in merge_plan(r["nodes"], r.get("fan"))
+        ],
         "ac_hours": round(r["hours"], 2),
+        "fan_hours": round(r.get("fan_hours", 0.0), 2),
         "energy_index": round(r["energy"], 3),
         "temp_min": round(r["tmin"], 1),
         "temp_max": round(r["tmax"], 1),
@@ -519,37 +618,54 @@ def run(inp: Inputs) -> dict[str, Any]:
     onk = [i for i in range(idx0) if on[i] is not None]
     on0 = 1 if onk and on[onk[-1]] > 0.5 else 0
 
+    fan_hist = resample(inp.fan, inp.g0, inp.n_hist, inp.data_end) if inp.fan else [None] * idx0
+    fo_hist = fan_only(fan_hist, on[:idx0])
+    fok = [v for v in fo_hist if v is not None]
+    fo0 = fok[-1] if fok else 0.0
+
     rooms = []
     for room in inp.rooms:
         R = resample(room["points"], inp.g0, inp.n_hist, inp.data_end)
-        fit = fit_room(R, Ti[:idx0], To[:idx0], S[:idx0], on[:idx0], s)
+        fit = fit_room(R, Ti[:idx0], To[:idx0], S[:idx0], on[:idx0], s, fo_hist)
         rk = [i for i in range(idx0) if R[i] is not None]
         rooms.append({**{k: room.get(k) for k in ("id", "name", "when")}, **fit, "R": R, "now": R[rk[-1]] if rk else None})
     limiting = [
-        {"coef": r["coef"], "when": r["when"]} for r in rooms if r["trusted"] and r["when"] != "never"
+        {"coef": r["coef"], "when": r["when"], "fan": r["fan_learned"]}
+        for r in rooms
+        if r["trusted"] and r["when"] != "never"
     ]
 
     ctx = make_ctx(To[idx0:], S[idx0:], inp.local_minutes, s, limiting)
+    ctx["fo0"] = fo0
     base_nodes = sorted((int(a), float(b)) for a, b in s.baseline)
     base = evaluate(m, base_nodes, ctx, ti0, on0, s, keep=True)
     active = None
     if inp.active_nodes:
-        active = evaluate(m, parse_nodes(inp.active_nodes), ctx, ti0, on0, s, keep=True)
+        plan = fan_plan(inp.active_nodes)
+        active = evaluate(
+            m, parse_nodes(inp.active_nodes), ctx, ti0, on0, s, keep=True, fan=plan if any(f for _, f in plan) else None
+        )
 
+    # The fan only ever helps a room, so it is tried just for schedules the house passes and a room fails.
+    use_fan = s.fan_enabled and not inp.fan_blocked and any(r["fan"] for r in limiting)
+    fans = fan_options(s) if use_fan else []
     best = least_bad = None
     n_cand = n_ok = 0
     for nodes in candidates(s):
-        n_cand += 1
-        r = evaluate(m, nodes, ctx, ti0, on0, s)
-        if least_bad is None or (r["viol"], r["score"]) < (least_bad["viol"], least_bad["score"]):
-            least_bad = r
-        if r["viol"] <= 0.0:
-            n_ok += 1
-            if best is None or r["score"] < best["score"]:
-                best = r
+        tries = [evaluate(m, nodes, ctx, ti0, on0, s)]
+        if fans and tries[0]["viol"] > 0 and tries[0]["viol_house"] <= 0:
+            tries += [evaluate(m, nodes, ctx, ti0, on0, s, fan=f) for f in fans]
+        for r in tries:
+            n_cand += 1
+            if least_bad is None or (r["viol"], r["score"]) < (least_bad["viol"], least_bad["score"]):
+                least_bad = r
+            if r["viol"] <= 0.0:
+                n_ok += 1
+                if best is None or r["score"] < best["score"]:
+                    best = r
 
     if best is not None:
-        best = evaluate(m, best["nodes"], ctx, ti0, on0, s, keep=True)  # re-run to keep the traces
+        best = evaluate(m, best["nodes"], ctx, ti0, on0, s, keep=True, fan=best["fan"])  # re-run to keep the traces
 
     ratio = val["ratio"]
     validated = ratio is not None and s.ratio_limits[0] <= ratio <= s.ratio_limits[1]
@@ -592,13 +708,15 @@ def run(inp: Inputs) -> dict[str, Any]:
         "ac_actual": [None if v is None else round(v, 2) for v in on[a:idx0]] + [None] * inp.n_hor,
         "indoor": {k: [None] * past + [r1(x) for x in r["Ti"]] for k, r in traces.items()},
         "ac": {k: [None] * past + [int(x) for x in r["on"]] for k, r in traces.items()},
+        "fan_actual": [None if v is None else round(v, 2) for v in fan_hist[a:idx0]] + [None] * inp.n_hor,
+        "fan": {k: [None] * past + [int(x) for x in (r["fan_bins"] or [0] * inp.n_hor)] for k, r in traces.items()},
         "rooms": [],
     }
     for room in rooms:
         pred = {}
         if room["coef"] is not None:
             for k, r in traces.items():
-                Tr = room_trace(room["coef"], r["Tfull"], r["on"], To[idx0:], S[idx0:], on0)[:-1]
+                Tr = room_trace(room["coef"], r["Tfull"], r["on"], To[idx0:], S[idx0:], on0, r["fo"], fo0)[:-1]
                 pred[k] = [None] * past + [r1(x) for x in Tr]
                 r.setdefault("room_max", {})[room["id"]] = max(Tr)
         series["rooms"].append(
@@ -675,11 +793,20 @@ def run(inp: Inputs) -> dict[str, Any]:
                 "rows": r["rows"],
                 "rmse": None if r["rmse"] is None else round(r["rmse"], 2),
                 "r2": None if r["r2"] is None else round(r["r2"], 3),
-                "coef": None if r["coef"] is None else dict(zip(("offset", "outdoor", "sun", "ac"), (round(c, 3) for c in r["coef"]))),
+                "coef": None if r["coef"] is None else dict(zip(("offset", "outdoor", "sun", "ac", "fan"), (round(c, 3) for c in r["coef"]))),
+                "fan_learned": r["fan_learned"],
                 "now": r1(r["now"]),
                 "max_next_24h": {k: r1(t.get("room_max", {}).get(r["id"])) for k, t in traces.items()},
             }
             for r in rooms
         ],
         "outdoor_sensors": outdoor_info,
+        "fan": {
+            "enabled": s.fan_enabled,
+            "blocked": inp.fan_blocked,
+            "learned_rooms": sum(1 for r in limiting if r["fan"]),
+            "searched": use_fan,
+            "proposed_hours": round(best["fan_hours"], 2) if best is not None else None,
+            "history_fan_only_hours": round(sum(fok) * STEP_H, 1),
+        },
     }

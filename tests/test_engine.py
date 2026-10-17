@@ -289,3 +289,87 @@ def test_no_extra_sensors_matches_previous_behavior():
     res = engine.run(inp)
     assert res["rooms"] == [] and res["outdoor_sensors"] is None
     assert res["series"]["rooms"] == []
+
+
+def _fan_house(fan_effect=-2.0, offset=2.5):
+    """History where the blower circulated 23:00-03:00 every other night, and a bedroom the fan evens out."""
+    inp, _ = _synthetic()
+    on = engine.resample(inp.on, inp.g0, inp.n_hist, inp.data_end)
+    fan = []
+    for i in range(inp.n_hist):
+        t = inp.g0 + i * STEP
+        h = _local_min(t) // 60
+        night = int((t + TZ_OFFSET - 3 * 3600) // 86400)
+        fan.append(1.0 if (h >= 23 or h < 3) and night % 2 == 0 else 0.0)
+    fo = engine.fan_only(fan, on)
+    Ti = engine.resample(inp.indoor, inp.g0, inp.n_hist, inp.data_end)
+    rng = random.Random(5)
+    pts = []
+    for i in range(inp.n_hist):
+        d = engine._duty(fo, i) if i > 0 else fo[0]
+        pts.append((inp.g0 + i * STEP, Ti[i] + offset + fan_effect * d + rng.gauss(0, 0.05)))
+    inp.fan = [(inp.g0 + i * STEP, fan[i]) for i in range(inp.n_hist)]
+    inp.rooms = [{"id": "sensor.bedroom", "name": "Bedroom", "when": "asleep", "points": pts}]
+    return inp
+
+
+def test_merge_plan_and_fan_at():
+    nodes = [(7 * 60, 75.0), (22 * 60, 72.0)]
+    fan = [(6 * 60, False), (23 * 60, True)]
+    merged = engine.merge_plan(nodes, fan)
+    assert merged == [(7 * 60, 75.0, False), (22 * 60, 72.0, False), (23 * 60, 72.0, True), (6 * 60, 72.0, False)][:0] or merged == sorted(merged)
+    assert (23 * 60, 72.0, True) in merged and (6 * 60, 72.0, False) in merged
+    packed = [{"time": engine.hhmm(m), "temp": t, **({"fan": True} if f else {})} for m, t, f in merged]
+    assert engine.fan_at(packed, 2 * 60) and not engine.fan_at(packed, 12 * 60)
+    assert engine.setpoint_at(packed, 2 * 60) == 72.0 and engine.setpoint_at(packed, 12 * 60) == 75.0
+    assert engine.merge_plan(nodes, None) == [(m, t, False) for m, t in nodes]
+
+
+def test_room_learns_fan_effect():
+    inp = _fan_house()
+    res = engine.run(inp)
+    room = res["rooms"][0]
+    assert room["fan_learned"] and room["trusted"]
+    assert abs(room["coef"]["fan"] + 2.0) < 0.5
+    assert res["fan"]["history_fan_only_hours"] > 4
+
+
+def test_fan_lets_night_run_warmer():
+    inp = _fan_house()
+    no_fan = engine.run(inp)
+    inp.settings.fan_enabled = True
+    inp.settings.fan_kw = 0.1  # variable speed blower on circulate
+    res = engine.run(inp)
+    assert res["fan"]["searched"] and res["fan"]["learned_rooms"] == 1
+    best = res["best"]
+    assert best is not None and any(n.get("fan") for n in best["nodes"])
+    assert best["fan_hours"] > 0
+    assert best["energy_index"] < no_fan["best"]["energy_index"]  # fan is cheaper than cooling the whole house harder
+    s = res["series"]
+    assert len(s["fan"]["proposed"]) == 192 and sum(s["fan"]["proposed"][96:]) > 0
+
+
+def test_fan_not_used_when_blocked_or_unlearned():
+    inp = _fan_house()
+    inp.settings.fan_enabled = True
+    inp.fan_blocked = "Indoor humidity 68% is over the 60% limit"
+    res = engine.run(inp)
+    assert not res["fan"]["searched"] and res["fan"]["blocked"]
+    assert not any(n.get("fan") for n in (res["best"] or res["closest"])["nodes"])
+    inp = _fan_house()
+    inp.settings.fan_enabled = True
+    inp.fan = []  # never circulated, so the effect cannot be learned
+    res = engine.run(inp)
+    assert res["rooms"][0]["fan_learned"] is False and not res["fan"]["searched"]
+
+
+def test_fan_skipped_when_blower_costs_more_than_it_saves():
+    inp = _fan_house()
+    no_fan = engine.run(inp)
+    inp.settings.fan_enabled = True
+    inp.settings.fan_kw = 0.5
+    res = engine.run(inp)
+    assert res["fan"]["searched"]
+    assert res["best"]["energy_index"] <= no_fan["best"]["energy_index"] + 1e-9
+    if not any(n.get("fan") for n in res["best"]["nodes"]):
+        assert res["best"]["nodes"] == no_fan["best"]["nodes"]

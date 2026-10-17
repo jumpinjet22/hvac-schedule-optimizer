@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.3.0";
+const CARD_VERSION = "0.4.0";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -300,18 +300,23 @@ class HvacScheduleCard extends HTMLElement {
       lines.push(["bad", "Nothing in the search keeps you inside your comfort limits for today's forecast. Raise a limit or lower the thermostat floor."]);
     if (r.active && r.active.overshoot > 0)
       lines.push(["warn", `Today's active schedule is predicted to run ${f1(r.active.overshoot)}${unit} over your comfort limit. The proposal stays inside it.`]);
+    const fan = r.fan;
+    if (fan && fan.enabled && fan.blocked) lines.push(["warn", `Fan circulation is paused: ${fan.blocked}.`]);
+    else if (fan && fan.enabled && !fan.learned_rooms)
+      lines.push(["warn", `Fan control is on, but no room has learned what the fan does yet (${f1(fan.history_fan_only_hours)} of 4 fan-only hours in history). Run the fan on circulate for a few evenings so it can learn.`]);
+    if (sch.fan_note) lines.push(["warn", `Fan held at normal: ${sch.fan_note}.`]);
     if (this._notice) lines.push(["bad", this._notice]);
     msgs.innerHTML = lines.map(([t, m]) => `<div class="msg ${t === "bad" ? "bad" : ""}">${this._esc(m)}</div>`).join("");
 
     const nodes = wrap.querySelector(".nodes");
     const pills = (list) =>
-      (list || []).map((n) => `<span class="pill">${fmtClock(toMin(n.time))} <span>\u2192</span> ${f1(n.temp)}${unit}</span>`).join("") ||
+      (list || []).map((n) => `<span class="pill">${fmtClock(toMin(n.time))} <span>\u2192</span> ${f1(n.temp)}${unit}${n.fan ? ' <span title="Fan circulates until the next change">\u00b7 fan</span>' : ""}</span>`).join("") ||
       `<span class="pill"><span>none</span></span>`;
     const proposed = r.best && r.best.nodes;
     nodes.innerHTML = `<div class="col"><h4>Active</h4>${pills(sch.nodes)}</div>
       <div class="col prop"><h4>Proposed</h4>${proposed ? pills(proposed) : '<span class="pill"><span>none</span></span>'}</div>`;
 
-    const canApply = !!(r.ok_to_apply && proposed && JSON.stringify(proposed) !== JSON.stringify(sch.nodes.map((n) => ({ time: n.time, temp: Number(n.temp) }))));
+    const canApply = !!(r.ok_to_apply && proposed && JSON.stringify(proposed) !== JSON.stringify(sch.nodes.map((n) => ({ time: n.time, temp: Number(n.temp), ...(n.fan ? { fan: true } : {}) }))));
     const actions = wrap.querySelector(".actions");
     actions.innerHTML = `
       <button class="b primary" data-a="apply" ${canApply ? "" : "disabled"}>Apply proposed</button>
@@ -390,7 +395,8 @@ class HvacScheduleCard extends HTMLElement {
     const W = 640, H = 270;
     const pad = { l: 38, r: 40, t: 12, b: 22 };
     const acH = 9, acGap = 4;
-    const acArea = acH * 2 + acGap + 10;
+    const fanRow = [].concat(s.fan_actual || [], (s.fan && (s.fan.proposed || s.fan.active)) || []).some((v) => v);
+    const acArea = acH * (fanRow ? 3 : 2) + acGap * (fanRow ? 2 : 1) + 10;
     const px0 = pad.l, px1 = W - pad.r;
     const py0 = pad.t, py1 = H - pad.b - acArea;
     const X = (i) => px0 + ((px1 - px0) * i) / (n - 1);
@@ -504,6 +510,15 @@ class HvacScheduleCard extends HTMLElement {
     }
     const lab = (txt, y) => { const t = el("text", { x: px0 - 6, y: y + 7.5, "text-anchor": "end" }, svg); t.textContent = txt; };
     lab("AC", rowY[0]); lab("new", rowY[1]);
+    if (fanRow) {
+      const fy = rowY[1] + acH + acGap;
+      const fanFuture = s.fan.proposed || s.fan.active || s.fan.baseline || [];
+      for (let i = 0; i < n; i++) {
+        const v = i < s.now_index ? (s.fan_actual || [])[i] : fanFuture[i];
+        if (v) el("rect", { x: X(i) - bw / 2, y: fy, width: bw + 0.4, height: acH, rx: 1.5, fill: "#26a69a", "fill-opacity": i < s.now_index ? 0.3 + 0.6 * Math.min(1, v) : 0.85 }, svg);
+      }
+      lab("fan", fy);
+    }
 
     // now marker
     el("line", { x1: xNow, x2: xNow, y1: py0 - 4, y2: py1 + acArea, stroke: "var(--primary-text-color, #212121)", "stroke-opacity": 0.5, "stroke-width": 1 }, svg);
@@ -532,6 +547,10 @@ class HvacScheduleCard extends HTMLElement {
       if (propSp) rows.push(["Proposed", `${f1(propSp[i])}${unit}`]);
       const ac = future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i];
       rows.push(["AC", ac === null || ac === undefined ? "-" : ac >= 0.5 ? "on" : "off"]);
+      if (fanRow) {
+        const fv = future ? (s.fan.proposed || s.fan.active || [])[i] : (s.fan_actual || [])[i];
+        rows.push([future ? "Fan (proposed)" : "Fan", fv === null || fv === undefined ? "-" : fv >= 0.5 ? "circulate" : "normal"]);
+      }
       tip.innerHTML = `<b>${fmtClock(lm[i])}</b>${future ? " \u00b7 forecast" : ""}` +
         rows.map(([k, v]) => `<div class="r"><span>${k}</span><span>${v}</span></div>`).join("");
       const hostBox = host.getBoundingClientRect();
