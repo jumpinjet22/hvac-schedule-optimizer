@@ -31,7 +31,15 @@ from .const import (
     CONF_BASE_SLEEP_HOUR,
     CONF_BASE_WAKE_HOUR,
     CONF_AC_KW,
+    CONF_AUX_BELOW,
+    CONF_AWAKE_MIN,
+    CONF_BASE_DAY_HEAT,
+    CONF_BASE_NIGHT_HEAT,
     CONF_CLIMATE,
+    CONF_DEADBAND,
+    CONF_HEAT_KIND,
+    CONF_SLEEP_MIN,
+    CONF_SWITCH_BELOW,
     CONF_FAN_CONTROL,
     CONF_FAN_HUMIDITY_MAX,
     CONF_FAN_MODE_CIRCULATE,
@@ -50,8 +58,13 @@ from .const import (
     DOMAIN,
     OPEN_METEO_URL,
     STORAGE_VERSION,
+    auto_switching,
     default_options,
     guess_fan_modes,
+    heat_ratios,
+    plan_mode,
+    run_mode,
+    setpoints_of,
     thermostat_fan_modes,
 )
 from .scheduler import Scheduler
@@ -108,9 +121,18 @@ def baseline_nodes(hass: HomeAssistant, options: dict[str, Any]) -> list[dict]:
     """The schedule the user runs today, as set in the options."""
     f = hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
     o = {**default_options(f), **options}
+    heat = o[CONF_HEAT_KIND] != "none"
     return [
-        {"time": engine.hhmm(int(o[CONF_BASE_WAKE_HOUR]) * 60), "temp": float(o[CONF_BASE_DAY_TEMP])},
-        {"time": engine.hhmm(int(o[CONF_BASE_SLEEP_HOUR]) * 60), "temp": float(o[CONF_BASE_NIGHT_TEMP])},
+        {
+            "time": engine.hhmm(int(o[CONF_BASE_WAKE_HOUR]) * 60),
+            "temp": float(o[CONF_BASE_DAY_TEMP]),
+            **({"heat": float(o[CONF_BASE_DAY_HEAT])} if heat else {}),
+        },
+        {
+            "time": engine.hhmm(int(o[CONF_BASE_SLEEP_HOUR]) * 60),
+            "temp": float(o[CONF_BASE_NIGHT_TEMP]),
+            **({"heat": float(o[CONF_BASE_NIGHT_HEAT])} if heat else {}),
+        },
     ]
 
 
@@ -183,7 +205,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_refresh()
 
     # ---------------------------------------------------------- comfort learning
-    async def async_record_change(self, old: float, new: float, source: str) -> None:
+    async def async_record_change(self, old: float, new: float, source: str, side: str = "cool") -> None:
         """A manual setpoint change: keep it with a snapshot of what the house was doing."""
         if not self.learn_enabled:
             return
@@ -192,12 +214,14 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         lm = local.hour * 60 + local.minute
         if self.comfort_events:
             last = self.comfort_events[-1]
-            if now - last["ts"] < UNDO_S and abs(last["from"] - new) < 1e-6:
+            if now - last["ts"] < UNDO_S and abs(last["from"] - new) < 1e-6 and last.get("side", "cool") == side:
                 self.comfort_events.pop()  # undone straight away
                 self._comfort.async_delay_save(self._comfort_data, 5)
                 self.async_update_listeners()
                 return
-        self.comfort_events.append({"ts": now, "lm": lm, "from": old, "to": new, "source": source, **self._snapshot()})
+        self.comfort_events.append(
+            {"ts": now, "lm": lm, "from": old, "to": new, "source": source, "side": side, **self._snapshot()}
+        )
         cutoff = now - COMFORT_DAYS * 86400
         self.comfort_events = [e for e in self.comfort_events if e["ts"] >= cutoff][-COMFORT_MAX_EVENTS:]
         self._comfort.async_delay_save(self._comfort_data, 5)
@@ -287,7 +311,40 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         s.fan_enabled = self.fan_config(climate_state) is not None
         s.fan_kw = float(o[CONF_FAN_WATTS]) / 1000.0
         s.ac_kw = float(o[CONF_AC_KW])
+        s.mode = plan_mode(climate_state, o) or "cool"
+        s.awake_min = float(o[CONF_AWAKE_MIN])
+        s.sleep_min = float(o[CONF_SLEEP_MIN])
+        s.heat_baseline = [
+            (int(o[CONF_BASE_WAKE_HOUR]) * 60, float(o[CONF_BASE_DAY_HEAT])),
+            (int(o[CONF_BASE_SLEEP_HOUR]) * 60, float(o[CONF_BASE_NIGHT_HEAT])),
+        ]
+        # Only one setpoint is live at a time while this integration switches modes itself.
+        s.min_deadband = 0.0 if auto_switching(climate_state, o) else float(o[CONF_DEADBAND])
+        s.heat_kind = o[CONF_HEAT_KIND] if o[CONF_HEAT_KIND] != "none" else "furnace"
+        for k, v in heat_ratios(o, f).items():
+            setattr(s, k, v)
+        s.aux_below = float(o[CONF_AUX_BELOW])
+        s.switch_below = float(o[CONF_SWITCH_BELOW])
         return s
+
+    def deadband(self) -> float:
+        """Smallest gap the thermostat accepts between its heat and cool setpoints (none while auto switching)."""
+        f = self._unit == UnitOfTemperature.FAHRENHEIT
+        o = {**default_options(f), **self.config_entry.options}
+        return 0.0 if auto_switching(self.hass.states.get(self.climate_entity), o) else float(o[CONF_DEADBAND])
+
+    def _auto_mode_wanted(self, result: dict[str, Any]) -> tuple[str | None, str]:
+        """Heat or cool, from what the running schedule's forecast needs over the next 2 hours."""
+        series = result.get("series") or {}
+        ni = series.get("now_index", 0)
+        heat = ((series.get("heat") or {}).get("active") or [])[ni : ni + 8]
+        ac = ((series.get("ac") or {}).get("active") or [])[ni : ni + 8]
+        h, c = sum(v or 0 for v in heat), sum(v or 0 for v in ac)
+        if h >= 0.5 and c == 0:
+            return "heat", "the plan needs heat in the next 2 hours"
+        if c >= 0.5 and h == 0:
+            return "cool", "the plan needs cooling in the next 2 hours"
+        return None, ""
 
     def fan_config(self, climate_state=None) -> tuple[str, str] | None:
         """(normal, circulate) when fan control is on and both modes still exist on the thermostat."""
@@ -322,6 +379,11 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             plan_bins = result.pop("plan_bins", None)
             if reason and plan_bins:
                 self._store_plan(plan_bins, reason)
+            o = {**default_options(self._unit == UnitOfTemperature.FAHRENHEIT), **self.config_entry.options}
+            if auto_switching(self.hass.states.get(self.climate_entity), o):
+                want, why = self._auto_mode_wanted(result)
+                if want:
+                    self.hass.async_create_task(self.scheduler.async_auto_switch(want, why))
         except Exception as err:  # noqa: BLE001 - surface any failure as a status instead of failing setup
             # Log once per distinct failure, not on every refresh.
             if str(err) != self._last_error:
@@ -345,9 +407,10 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         state = self.hass.states.get(self.climate_entity)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             raise HomeAssistantError(f"{self.climate_entity} is unavailable")
-        if state.state != "cool":
+        o_all = {**self.config_entry.options}
+        if plan_mode(state, o_all) is None:
             raise HomeAssistantError(
-                f"{self.climate_entity} is in '{state.state}' mode. This version only optimizes cooling."
+                f"{self.climate_entity} is in '{state.state}' mode. The optimizer plans for cool, heat and heat_cool."
             )
         settings = self._settings(state)
         days = self._history_days()
@@ -384,6 +447,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         modes = thermostat_fan_modes(state)
         circ_mode = (self.fan_config(state) or (None, guess_fan_modes(modes)[1] if modes else None))[1]
         indoor, on, setp, fan, thermostat_temp = [], [], [], [], []
+        heat, heat_sp, mode_pts = [], [], []
         for st in states.get(self.climate_entity, []):
             ts = st.last_updated.timestamp()
             if st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
@@ -391,6 +455,9 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 on.append((ts, None))
                 setp.append((ts, None))
                 fan.append((ts, None))
+                heat.append((ts, None))
+                heat_sp.append((ts, None))
+                mode_pts.append((ts, None))
                 continue
             a = st.attributes
             if not sensor:
@@ -398,15 +465,19 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 thermostat_temp.append((ts, _num(a.get("current_temperature"))))
             action = a.get("hvac_action")
-            on.append((ts, None if action in (None, "heating") else (1.0 if action == "cooling" else 0.0)))
-            setp.append((ts, _num(a.get("temperature"))))
+            on.append((ts, None if action is None else (1.0 if action == "cooling" else 0.0)))
+            heat.append((ts, None if action is None else (1.0 if action in ("heating", "preheating") else 0.0)))
+            cool_t, heat_t = setpoints_of(st)
+            setp.append((ts, cool_t))
+            heat_sp.append((ts, heat_t))
+            mode_pts.append((ts, run_mode(st) or "off"))
             if modes:
                 fm = a.get("fan_mode")
                 forced = action == "fan" or (circ_mode is not None and fm == circ_mode)
                 fan.append((ts, 1.0 if forced else (0.0 if fm is not None or action is not None else None)))
         if sensor:
             indoor = self._sensor_points(states.get(sensor, []))
-        for series in (indoor, on, setp):
+        for series in (indoor, on, setp, heat, heat_sp, mode_pts):
             series.sort(key=lambda p: p[0])
 
         wts, wtemp, wsun = await self._fetch_weather(days)
@@ -455,6 +526,9 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             comfort_forgotten=self.comfort_forgotten,
             humidity_now=self._humidity(),
             quick=quick,
+            heat=heat,  # always: heating periods must not look like "AC off" to the cooling fit
+            heat_setpoint=heat_sp,
+            modes=mode_pts,
         )
         try:
             result = await self.hass.async_add_executor_job(engine.run, inputs)

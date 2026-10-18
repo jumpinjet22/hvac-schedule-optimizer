@@ -20,7 +20,7 @@ from .coordinator import OptimizerCoordinator
 def _nodes_text(nodes: list[dict] | None) -> str | None:
     if not nodes:
         return None
-    return ", ".join(f"{n['time']} {n['temp']}°" for n in nodes)
+    return ", ".join(f"{n['time']} {n['temp']}°" + (f"/heat {n['heat']}°" if n.get("heat") is not None else "") for n in nodes)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -60,6 +60,7 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
         attrs_fn=lambda c: {
             "nodes": (_data(c).get("best") or {}).get("nodes"),
             "ac_hours": (_data(c).get("best") or {}).get("ac_hours"),
+            "heat_hours": (_data(c).get("best") or {}).get("heat_hours"),
             "temp_min": (_data(c).get("best") or {}).get("temp_min"),
             "temp_max": (_data(c).get("best") or {}).get("temp_max"),
             "closest_if_none_comfortable": (_data(c).get("closest") or {}).get("nodes"),
@@ -93,7 +94,9 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
         attrs_fn=lambda c: {
             "baseline_ac_hours": (_data(c).get("baseline") or {}).get("ac_hours"),
             "proposed_ac_hours": (_data(c).get("best") or {}).get("ac_hours"),
-            "note": "Relative compressor energy estimate for the next 24h, not kWh.",
+            "baseline_heat_hours": (_data(c).get("baseline") or {}).get("heat_hours"),
+            "proposed_heat_hours": (_data(c).get("best") or {}).get("heat_hours"),
+            "note": "Relative energy cost estimate for the next 24h (heating priced against AC hours), not kWh.",
         },
     ),
     OptimizerSensorDescription(
@@ -111,6 +114,13 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
             "control_off_at": (_data(c).get("control") or {}).get("used_off_at"),
             "control_on_at": (_data(c).get("control") or {}).get("used_on_at"),
             "control_source": (_data(c).get("control") or {}).get("source"),
+            "mode": _data(c).get("mode"),
+            "heat_learned": _data(c).get("heat_learned"),
+            "predicted_heat_hours_per_day": (_data(c).get("validation") or {}).get("heat_predicted_hours"),
+            "actual_heat_hours_per_day": (_data(c).get("validation") or {}).get("heat_actual_hours"),
+            "heat_ratio": (_data(c).get("validation") or {}).get("heat_ratio"),
+            "heat_control_on_at": (_data(c).get("heat_control") or {}).get("used_on_at"),
+            "heat_control_off_at": (_data(c).get("heat_control") or {}).get("used_off_at"),
             "residual_used": (_data(c).get("residual") or {}).get("used"),
             "residual_coef": (_data(c).get("residual") or {}).get("coef"),
             "forecast_accuracy": ((_data(c).get("series") or {}).get("accuracy")),

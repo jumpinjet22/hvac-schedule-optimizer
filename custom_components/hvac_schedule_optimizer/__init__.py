@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.5.0-beta.1"
+CARD_VERSION = "0.6.0-beta.1"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ _NODE = vol.Schema(
     {
         vol.Required("time"): vol.All(cv.time, lambda t: t.strftime("%H:%M")),
         vol.Required("temp"): vol.Coerce(float),
+        vol.Optional("heat"): vol.Coerce(float),
         vol.Optional("fan", default=False): cv.boolean,
     }
 )
@@ -122,6 +123,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
     scheduler.fan_config = coordinator.fan_config
     scheduler.fan_blocked = coordinator.fan_blocked
     scheduler.on_manual_change = coordinator.async_record_change
+    scheduler.deadband = coordinator.deadband
     entry.runtime_data = RuntimeData(coordinator, scheduler)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -2,7 +2,7 @@ set_schedule:
   fields:
     nodes:
       required: true
-      example: '[{"time": "07:00", "temp": 74}, {"time": "22:00", "temp": 70}]'
+      example: '[{"time": "07:00", "temp": 74, "heat": 68}, {"time": "22:00", "temp": 70, "heat": 65}]'
       selector:
         object:
     climate_entity:

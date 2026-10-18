@@ -612,3 +612,164 @@ def test_quick_refresh_grid_is_smaller_and_still_comfortable():
     assert quick["candidates"] < full["candidates"] / 5
     assert quick["best"] is not None and quick["best"]["overshoot"] == 0
     assert quick["best"]["energy_index"] <= full["best"]["energy_index"] * 1.03
+
+
+# ------------------------------------------------------------------ heating
+def _winter(history_days=14, noise=0.05, seed=11, mode="heat", kind="furnace", cold=40.0, hband=(0.6, -0.6), room_cold=0.0):
+    """A house heated by a furnace (h) in cold weather. mode "heat_cool" also keeps a cool setpoint far above."""
+    rng = random.Random(seed)
+    s = engine.Settings.defaults(True)
+    s.mode = mode
+    s.heat_kind = kind
+    n_hist = history_days * 96
+    t0 = 1_792_000_000 - (1_792_000_000 % STEP)
+    g0 = t0 - n_hist * STEP
+    ts = [g0 + i * STEP for i in range(n_hist + 96)]
+
+    def wxf(t):
+        temp, sun = _weather(t)
+        return temp - cold, sun * 0.6
+
+    wx = [wxf(t) for t in ts]
+    truth = {"k": 0.09, "g": 1.1, "q": 0.15, "c": 3.2, "h": 6.0}
+    from bisect import bisect_right
+
+    hm = [m for m, _ in s.heat_baseline]
+    ht = [t for _, t in s.heat_baseline]
+    sph = [ht[bisect_right(hm, _local_min(t)) - 1] for t in ts[:n_hist]]
+    cool = [80.0 if mode == "heat_cool" else None] * n_hist
+    Ti, on, heat = engine.simulate(
+        truth, [w[0] for w in wx[:n_hist]], [w[1] for w in wx[:n_hist]], 67.0, cool, 0.75, 0, None, sph, hband, 0
+    )
+    first_hour = g0 - (g0 % 3600) - 3600
+    wts = [first_hour + h * 3600 for h in range(int((ts[-1] - first_hour) / 3600) + 3)]
+    inp = engine.Inputs(
+        g0=g0, n_hist=n_hist, n_hor=96, data_end=t0,
+        indoor=[(ts[i], Ti[i] + rng.gauss(0, noise)) for i in range(n_hist)],
+        on=[(ts[i], float(on[i])) for i in range(n_hist)],
+        setpoint=[(ts[i], cool[i]) for i in range(n_hist)],
+        weather_ts=wts, weather_temp=[wxf(t)[0] for t in wts], weather_sun=[wxf(t)[1] for t in wts],
+        local_minutes=[_local_min(t) for t in ts[n_hist:]], settings=s,
+        heat=[(ts[i], float(heat[i])) for i in range(n_hist)],
+        heat_setpoint=[(ts[i], sph[i]) for i in range(n_hist)],
+        modes=[(g0, mode)],
+    )
+    if room_cold:
+        # a room that drops room_cold degrees below the thermostat while the furnace runs (duty over the hour)
+        pts = []
+        for i in range(n_hist):
+            duty = sum(heat[max(0, i - 4):i]) / 4 if i else 0.0
+            pts.append((ts[i], Ti[i] - 0.5 - room_cold * duty + rng.gauss(0, 0.05)))
+        inp.rooms = [{"id": "sensor.kids", "name": "Kids", "when": "always", "points": pts}]
+    return inp, truth
+
+
+def test_heat_mode_learns_furnace_and_keeps_minimums():
+    inp, truth = _winter()
+    r = engine.run(inp)
+    assert r["mode"] == "heat" and r["heat_learned"]
+    assert abs(r["model"]["h"] - truth["h"]) < 1.0
+    assert 0.8 < r["validation"]["heat_ratio"] < 1.2
+    assert r["status"] == "ready", r["status"]
+    nodes = r["best"]["nodes"]
+    assert all("heat" in n for n in nodes)
+    pred = r["series"]["indoor"]["proposed"][r["series"]["now_index"]:]
+    lim = r["series"]["limit_min"][r["series"]["now_index"]:]
+    assert all(p is None or l is None or p >= l - 0.3 for p, l in zip(pred[1:], lim))
+    assert r["runtime"]["kind"] == "heat" and r["runtime"]["proposed"]["hours"] > 0
+    assert all(v is None for v in r["series"]["limit"][r["series"]["now_index"]:])  # no cooling limit in heat mode
+
+
+def test_heat_mode_without_heating_history_says_so():
+    inp, _ = _synthetic()
+    inp.settings.mode = "heat"
+    try:
+        engine.run(inp)
+        raise AssertionError("expected a ModelError")
+    except engine.ModelError as err:
+        assert "heat" in str(err)
+
+
+def test_heat_pump_avoids_deep_setbacks_that_need_backup_strips():
+    def depth(kind):
+        inp, _ = _winter(kind=kind, cold=45.0)
+        inp.settings.aux_ratio = 4.0
+        inp.settings.aux_below = 0.0  # strips only for big warm-ups here
+        inp.settings.heat_ratio = 0.9 if kind == "heat_pump" else 1.5
+        r = engine.run(inp)
+        heats = [n["heat"] for n in r["best"]["nodes"]]
+        return max(heats) - min(heats), r
+
+    furnace, rf = depth("furnace")
+    pump, rp = depth("heat_pump")
+    assert pump <= furnace
+    assert rf["heat_kind"] == "furnace" and rp["heat_kind"] == "heat_pump"
+
+
+def test_heat_cost_by_kind():
+    s = engine.Settings.defaults(True)
+    s.heat_kind = "heat_pump"
+    assert engine.heat_cost(30.0, 0.5, s) == s.aux_ratio  # cold outside: strips
+    assert engine.heat_cost(50.0, 3.0, s) == s.aux_ratio  # big warm-up: strips
+    assert s.heat_ratio <= engine.heat_cost(40.0, 0.5, s) < s.aux_ratio
+    s.heat_kind = "dual_fuel"
+    assert engine.heat_cost(30.0, 3.0, s) == s.gas_ratio
+    s.heat_kind = "furnace"
+    assert engine.heat_cost(10.0, 5.0, s) == s.heat_ratio
+
+
+def test_heat_cool_keeps_the_deadband_and_both_setpoints():
+    inp, _ = _winter(mode="heat_cool", cold=20.0)
+    r = engine.run(inp)
+    assert r["mode"] == "heat_cool"
+    nodes = r["best"]["nodes"]
+    assert all("heat" in n for n in nodes)
+    assert all(n["heat"] <= n["temp"] - inp.settings.min_deadband for n in nodes)
+    assert r["series"]["limit"][r["series"]["now_index"]] is not None or r["series"]["limit_min"][r["series"]["now_index"]] is not None
+
+
+def test_cool_mode_passes_heat_values_through_untouched():
+    inp, _ = _synthetic()
+    inp.active_nodes = [{"time": "08:00", "temp": 75, "heat": 66}, {"time": "22:00", "temp": 72, "heat": 63}]
+    r = engine.run(inp)
+    heats = {n.get("heat") for n in r["best"]["nodes"]}
+    assert heats <= {66, 63}  # cooling search never invents heat values
+
+
+def test_room_learns_it_runs_cold_while_heating():
+    inp, _ = _winter(room_cold=2.0)
+    r = engine.run(inp)
+    room = r["rooms"][0]
+    assert room["heat_learned"] and room["coef"]["heat"] < -1.0
+
+
+def test_merge_all_and_heat_plan():
+    nodes = [{"time": "06:00", "temp": 76, "heat": 68}, {"time": "22:00", "temp": 74, "heat": 64}]
+    hp = engine.heat_plan(nodes)
+    assert hp == [(360, 68.0), (1320, 64.0)]
+    merged = engine.merge_all([(360, 76.0), (1320, 74.0)], None, [(300, 68.0), (1320, 64.0)])
+    assert merged[0] == (300, 74.0, False, 68.0) and merged[-1] == (1320, 74.0, False, 64.0)
+    assert engine.heat_plan([{"time": "06:00", "temp": 76}]) is None
+
+
+def test_comfort_heat_side_learns_from_turn_ups():
+    s = engine.Settings.defaults(True)
+    s.mode = "heat"
+    now = 1_792_000_000 - 30 * 86400 + 20 * 86400
+    ev = lambda d, h, frm, to, **kw: {**_ev(d, h, frm=frm, to=to, indoor=66.5, **kw), "side": "heat"}
+    # 6 AM sits between the sleep and awake hours, so only the lower sleep minimum applies there
+    out = engine.learn_comfort([ev(15, 6, 66, 69), ev(17, 6, 66, 69)], now, s, None, set())
+    rule = out["rules"][0]
+    assert rule["side"] == "min" and rule["cause"] == "cold_time" and rule["max"] == 67.5
+    assert rule["start"] == 5 * 60
+    # at 7 AM the configured 68 awake minimum already covers it: nothing to tighten
+    assert not engine.learn_comfort([ev(15, 7, 66, 69), ev(17, 7, 66, 69)], now, s, None, set())["rules"]
+    room = {"sensor.kids": {"t": 68.0, "trend": -0.2}}
+    warm = lambda d: {**ev(d, 21, 68, 70, rooms=room), "indoor": 70.0}
+    out = engine.learn_comfort([warm(15), warm(17)], now, s, None, {"sensor.kids"})
+    assert out["rules"][0]["cause"] == "cold_room" and out["rules"][0]["max"] == 69.0
+    down = engine.learn_comfort([ev(15, 13, 70, 68), ev(17, 13, 70, 68)], now, s, None, set())
+    assert not down["rules"] and down["notes"][0]["side"] == "heat"
+    # a learned minimum raises the heating limit only inside its window
+    ctx = engine.make_ctx([40.0] * 24, [0.0] * 24, [h * 60 for h in range(24)], s, learned=[{**rule, "kind": "house", "start": 6 * 60, "end": 9 * 60, "max": 70.0}])
+    assert ctx["lim_min"][1 + 7] == 70.0 and ctx["lim_min"][1 + 12] == s.awake_min

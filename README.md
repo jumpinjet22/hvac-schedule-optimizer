@@ -7,7 +7,7 @@ its model actually matches reality, then designs a daily schedule that uses less
 while staying inside comfort limits you set. It also runs the schedule itself, so you do not
 need another scheduler integration.
 
-> Version 0.5. Cooling only. Single thermostat per entry. Includes a dashboard card.
+> Version 0.6. Cooling and heating. Single thermostat per entry. Includes a dashboard card.
 
 ## How it works
 
@@ -39,6 +39,35 @@ need another scheduler integration.
 
 It re-runs every 15 minutes so the chart keeps up with the clock. Only the daily run time can
 auto-apply.
+
+### Heating
+
+Heating works the same way, for any common setup:
+
+- **Gas furnace, electric furnace or baseboard, heat pump with backup strips, or dual fuel**
+  (heat pump with gas below a switch-over temperature). Pick it on the **Heating** options page,
+  and enter rough prices and equipment sizes on the **Costs** page so heat and cooling are
+  weighed fairly.
+- The house model learns how fast your heat warms the house, and where the thermostat really
+  starts and stops it, from the heating already in your history. Rooms learn whether they run
+  cold while the heat is on.
+- It keeps the house above minimum temperatures you set for awake and sleep hours, at the
+  lowest cost. A gas furnace gets deeper overnight setbacks with a warm-up before you wake.
+  A heat pump gets gentler ones, because a big or cold-weather warm-up runs the backup strips.
+- **heat_cool (auto) thermostats:** the lower setpoint is the heat and the upper one the cooling.
+  Both are scheduled, and they are never set closer than the gap you choose (ecobee needs 5 °F
+  by default, others 2 to 3 °F). The thermostat still does the switching itself, so it keeps
+  working if Home Assistant is down.
+- **Heat only or cool only:** whichever setpoint the mode uses is scheduled. A schedule entry
+  can carry `heat:` as well as `temp:`; in cool mode the heat values are kept but not written.
+- **Thermostats without heat_cool** can opt in to having the integration switch between heat
+  and cool when the forecast plan needs it. It holds a mode at least 3 hours, backs off for
+  12 hours after anyone picks a mode by hand, and never switches a thermostat that is off.
+  If Home Assistant is down the thermostat stays in its last mode, so leave this off if that
+  would be a problem in your climate.
+- Comfort learning works for heat too: turning the heat **up** on 2 days for the same reason (a
+  cold room, a cold day, or that time of day) raises that minimum, with the same limits and
+  fading as on the cooling side.
 
 ### Learning from your changes
 
@@ -95,8 +124,14 @@ folder and restart.
    - **Fan** (only shown when your thermostat reports fan modes). Turn on fan control and pick
      which of your thermostat's own modes is *normal* (blower runs with cooling only) and which
      is *circulate* (blower runs on its own). The integration guesses both from the mode names.
-     Also set the blower's power on circulate, the AC's power, and a humidity limit above which
-     it will not circulate.
+     Also set the blower's power on circulate and a humidity limit above which it will not
+     circulate.
+   - **Heating** (only shown when your thermostat can heat): what heats the house, minimum
+     temperatures for awake and sleep hours, your current heat setpoints, the smallest gap your
+     thermostat allows between heat and cool setpoints, and (for thermostats without heat_cool)
+     whether the integration may switch modes for you.
+   - **Costs**: AC power, electricity price, and only what your heat source needs (gas price and
+     furnace rating, electric heat power, or backup strip power and lockout temperature).
 3. How the fan is used: every room learns how much the blower running on its own evens it out,
    once the history holds about 4 hours of fan-only running. The optimizer then tries short
    circulate windows (around bedtime, overnight, late afternoon, all day) only for schedules that
@@ -129,8 +164,8 @@ Service `hvac_schedule_optimizer.set_schedule` sets the active schedule by hand:
 service: hvac_schedule_optimizer.set_schedule
 data:
   nodes:
-    - { time: "07:00", temp: 74 }
-    - { time: "22:00", temp: 70 }
+    - { time: "07:00", temp: 74, heat: 68 }   # heat is optional
+    - { time: "22:00", temp: 70, heat: 65 }
 ```
 
 ## Dashboard card
@@ -171,13 +206,13 @@ If the card does not show up after installing, restart Home Assistant and hard r
 - Turn off the thermostat's own built-in schedule too: its changes would look like yours to the
   comfort learning.
 - Planning forecasts (14 days) and your manual changes (60 days) are stored in `.storage`.
-- It only acts while the thermostat is in `cool` mode.
+- It acts in `cool`, `heat` and `heat_cool` (or `auto` with two setpoints). In `off`, `dry` and
+  `fan_only` it leaves the thermostat alone.
 - Setpoints are clamped to the thermostat's own min and max.
 - Schedules are stored in `.storage` and survive restarts. The previous schedule is always kept.
 
 ## Limitations (planned work)
 
-- Heating season is not modeled yet.
 - One schedule for every day of the week.
 - Needs a few days of AC cycling in the recorder to fit the model.
 - Energy savings assume compressor power rises about 1.2% per degree of outdoor temperature

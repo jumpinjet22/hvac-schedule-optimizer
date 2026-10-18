@@ -18,7 +18,7 @@
     "step": {
       "init": {
         "title": "Comfort limits and schedule",
-        "description": "Temperatures use your Home Assistant unit. The optimizer only proposes schedules that keep the house under these limits. The baseline is your current schedule, used for the savings comparison and as the starting schedule.",
+        "description": "Temperatures use your Home Assistant unit. The optimizer only proposes schedules that keep the house under these limits while cooling (heating limits are on a later page). The baseline is your current schedule, used for the savings comparison and as the starting schedule.",
         "data": {
           "awake_start": "Awake from (hour)",
           "awake_end": "Awake until (hour)",
@@ -47,20 +47,55 @@
       },
       "fan": {
         "title": "Fan",
-        "description": "Your thermostat reports these fan modes: {modes}.\n\nWith fan control on, the optimizer can circulate the blower to even out rooms, but only once a room has learned what the fan does (about 4 hours of fan-only running in history) and only when it costs less than cooling the whole house harder. The fan always goes back to the normal mode when a fan window ends, when you pause the schedule, and when the integration unloads.",
+        "description": "Your thermostat reports these fan modes: {modes}.\n\nWith fan control on, the optimizer can circulate the blower to even out rooms, but only once a room has learned what the fan does (about 4 hours of fan-only running in history) and only when it costs less than running the AC or heat harder. The fan always goes back to the normal mode when a fan window ends, when you pause the schedule, and when the integration unloads.",
         "data": {
           "fan_control": "Let the optimizer use the fan",
           "fan_mode_normal": "Normal mode (blower runs only with cooling)",
           "fan_mode_circulate": "Circulate mode (blower runs on its own)",
           "fan_watts": "Blower power on circulate (W)",
-          "ac_kw": "AC power while cooling (kW)",
           "fan_humidity_max": "Do not circulate above this indoor humidity (%)",
           "humidity_sensor": "Indoor humidity sensor (optional)"
         },
         "data_description": {
           "fan_watts": "Variable speed blowers on circulate often draw 50 to 150 W; older single speed blowers 300 to 500 W.",
-          "ac_kw": "Roughly 1 kW per ton of cooling. Used only to weigh blower time against AC time.",
           "humidity_sensor": "If empty, the thermostat's own humidity reading is used when it has one. Circulating right after cooling can blow moisture off the coil back into the house."
+        }
+      },
+      "heating": {
+        "title": "Heating",
+        "description": "Your thermostat reports these modes: {modes}.\n\nThe heating side works like cooling: the house learns how fast your heat warms it and where the thermostat turns it on and off, and the optimizer keeps the house above these minimums at the lowest cost. In heat_cool (auto) mode the lower setpoint is the heat and the upper one the cooling, and they never come closer than the gap below.",
+        "data": {
+          "heat_kind": "What heats the house",
+          "awake_min": "Minimum temperature while awake",
+          "sleep_min": "Minimum temperature while asleep",
+          "baseline_day_heat": "Current schedule: day heat setpoint",
+          "baseline_night_heat": "Current schedule: night heat setpoint",
+          "min_deadband": "Minimum gap between heat and cool setpoints",
+          "auto_mode": "Switch between heat and cool for me"
+        },
+        "data_description": {
+          "heat_kind": "Heat pumps get cheaper warm-ups planned gently, because a big or cold-weather warm-up turns on the expensive backup strips.",
+          "min_deadband": "The smallest gap your thermostat accepts between the two setpoints in heat_cool mode. ecobee defaults to 5 °F, many others to 2 or 3 °F.",
+          "auto_mode": "Only for thermostats without a heat_cool mode. The integration switches to heat or cool when the forecast plan needs it, holds a mode at least 3 hours, and never overrides a mode someone set by hand that day. If Home Assistant is down the thermostat stays in its last mode."
+        }
+      },
+      "costs": {
+        "title": "Energy prices and equipment",
+        "description": "Used to weigh heating, cooling and the fan against each other. Rough numbers are fine; savings are reported relative to your current schedule. Gas price is {gas_unit}, the furnace rating in {furnace_unit}.",
+        "data": {
+          "ac_kw": "AC power while cooling (kW)",
+          "electricity_price": "Electricity price per kWh",
+          "gas_price": "Gas price",
+          "furnace_size": "Furnace input rating",
+          "electric_heat_kw": "Electric heat power (kW)",
+          "aux_kw": "Backup heat strips power (kW)",
+          "aux_below": "Backup strips run below this outdoor temperature",
+          "switch_below": "Switch from heat pump to gas below this outdoor temperature"
+        },
+        "data_description": {
+          "ac_kw": "Roughly 1 kW per ton of cooling. A heat pump draws about the same while heating.",
+          "furnace_size": "The input rating on the furnace label (for example 60000 BTU/h or 17.6 kW).",
+          "aux_below": "Most heat pumps lock out the compressor or lean on the strips somewhere between 25 and 40 °F (-4 to 4 °C)."
         }
       }
     },
@@ -75,6 +110,15 @@
         "awake": "Awake hours",
         "asleep": "Sleep hours",
         "never": "Never (watch only)"
+      }
+    },
+    "heat_kind": {
+      "options": {
+        "furnace": "Gas furnace",
+        "electric": "Electric furnace or baseboard",
+        "heat_pump": "Heat pump with backup strips",
+        "dual_fuel": "Dual fuel (heat pump with gas backup)",
+        "none": "No heating"
       }
     }
   }

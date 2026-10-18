@@ -19,7 +19,22 @@ from .const import (
     CONF_BASE_SLEEP_HOUR,
     CONF_BASE_WAKE_HOUR,
     CONF_AC_KW,
+    CONF_AUTO_MODE,
+    CONF_AUX_BELOW,
+    CONF_AUX_KW,
+    CONF_AWAKE_MIN,
+    CONF_BASE_DAY_HEAT,
+    CONF_BASE_NIGHT_HEAT,
     CONF_CLIMATE,
+    CONF_DEADBAND,
+    CONF_ELEC_HEAT_KW,
+    CONF_ELEC_PRICE,
+    CONF_FURNACE_SIZE,
+    CONF_GAS_PRICE,
+    CONF_HEAT_KIND,
+    CONF_SLEEP_MIN,
+    CONF_SWITCH_BELOW,
+    HEAT_KINDS,
     CONF_FAN_CONTROL,
     CONF_FAN_HUMIDITY_MAX,
     CONF_FAN_MODE_CIRCULATE,
@@ -40,6 +55,7 @@ from .const import (
     default_options,
     guess_fan_modes,
     thermostat_fan_modes,
+    thermostat_modes,
 )
 
 
@@ -141,12 +157,77 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         """Only shown when the thermostat reports fan modes; the dropdowns list its own mode names."""
         modes = thermostat_fan_modes(self.hass.states.get(self.config_entry.data[CONF_CLIMATE]))
         if not modes:
-            return self.async_create_entry(title="", data={**self._data, CONF_FAN_CONTROL: False})
+            self._data[CONF_FAN_CONTROL] = False
+            return await self.async_step_heating()
         if user_input is not None:
             if user_input[CONF_FAN_CONTROL] and user_input[CONF_FAN_MODE_NORMAL] == user_input[CONF_FAN_MODE_CIRCULATE]:
                 return self._fan_form(modes, user_input, {"base": "same_fan_mode"})
-            return self.async_create_entry(title="", data={**self._data, **user_input})
+            self._data.update(user_input)
+            return await self.async_step_heating()
         return self._fan_form(modes, None, {})
+
+    def _cur(self) -> tuple[dict[str, Any], bool]:
+        fahrenheit = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
+        return {**default_options(fahrenheit), **self.config_entry.options, **self._data}, fahrenheit
+
+    async def async_step_heating(self, user_input: dict[str, Any] | None = None):
+        """Heat source and heating comfort. Skipped for thermostats that cannot heat."""
+        modes = thermostat_modes(self.hass.states.get(self.config_entry.data[CONF_CLIMATE]))
+        if "heat" not in modes and "heat_cool" not in modes:
+            self._data[CONF_HEAT_KIND] = "none"
+            return await self.async_step_costs()
+        if user_input is not None:
+            self._data.update(user_input)
+            return await self.async_step_costs()
+        cur, fahrenheit = self._cur()
+        t_lo, t_hi, t_step = (45, 85, 1) if fahrenheit else (7, 29, 0.5)
+        kind = selector.SelectSelector(
+            selector.SelectSelectorConfig(options=HEAT_KINDS, translation_key="heat_kind", mode=selector.SelectSelectorMode.DROPDOWN)
+        )
+        fields: dict[Any, Any] = {
+            vol.Required(CONF_HEAT_KIND, default=cur[CONF_HEAT_KIND]): kind,
+            vol.Required(CONF_AWAKE_MIN, default=cur[CONF_AWAKE_MIN]): _box(t_lo, t_hi, t_step),
+            vol.Required(CONF_SLEEP_MIN, default=cur[CONF_SLEEP_MIN]): _box(t_lo, t_hi, t_step),
+            vol.Required(CONF_BASE_DAY_HEAT, default=cur[CONF_BASE_DAY_HEAT]): _box(t_lo, t_hi, t_step),
+            vol.Required(CONF_BASE_NIGHT_HEAT, default=cur[CONF_BASE_NIGHT_HEAT]): _box(t_lo, t_hi, t_step),
+            vol.Required(CONF_DEADBAND, default=cur[CONF_DEADBAND]): _box(0.5, 10, 0.5),
+        }
+        # Thermostats without a two-setpoint mode can have this integration switch heat and cool.
+        if "heat_cool" not in modes and "heat" in modes and "cool" in modes:
+            fields[vol.Required(CONF_AUTO_MODE, default=bool(cur[CONF_AUTO_MODE]))] = selector.BooleanSelector()
+        return self.async_show_form(
+            step_id="heating", data_schema=vol.Schema(fields), description_placeholders={"modes": ", ".join(modes)}
+        )
+
+    async def async_step_costs(self, user_input: dict[str, Any] | None = None):
+        """Prices and equipment sizes, only the ones the chosen heat source needs."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data={**self._data, **user_input})
+        cur, fahrenheit = self._cur()
+        kind = cur[CONF_HEAT_KIND]
+        fields: dict[Any, Any] = {
+            vol.Required(CONF_AC_KW, default=cur[CONF_AC_KW]): _box(0.5, 15, 0.1),
+            vol.Required(CONF_ELEC_PRICE, default=cur[CONF_ELEC_PRICE]): _box(0.01, 2, 0.005),
+        }
+        if kind in ("furnace", "dual_fuel"):
+            fields[vol.Required(CONF_GAS_PRICE, default=cur[CONF_GAS_PRICE])] = _box(0.001, 10, 0.001)
+            fields[vol.Required(CONF_FURNACE_SIZE, default=cur[CONF_FURNACE_SIZE])] = (
+                _box(10000, 250000, 1000) if fahrenheit else _box(3, 75, 0.1)
+            )
+        if kind == "electric":
+            fields[vol.Required(CONF_ELEC_HEAT_KW, default=cur[CONF_ELEC_HEAT_KW])] = _box(1, 40, 0.5)
+        o_lo, o_hi = (-20, 60) if fahrenheit else (-30, 15)
+        if kind == "heat_pump":
+            fields[vol.Required(CONF_AUX_KW, default=cur[CONF_AUX_KW])] = _box(0, 40, 0.5)
+            fields[vol.Required(CONF_AUX_BELOW, default=cur[CONF_AUX_BELOW])] = _box(o_lo, o_hi, 0.5)
+        if kind == "dual_fuel":
+            fields[vol.Required(CONF_SWITCH_BELOW, default=cur[CONF_SWITCH_BELOW])] = _box(o_lo, o_hi, 0.5)
+        units = ("$/therm", "BTU/h") if fahrenheit else ("per kWh", "kW")
+        return self.async_show_form(
+            step_id="costs",
+            data_schema=vol.Schema(fields),
+            description_placeholders={"gas_unit": units[0], "furnace_unit": units[1]},
+        )
 
     def _fan_form(self, modes: list[str], given: dict[str, Any] | None, errors: dict[str, str]):
         fahrenheit = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
@@ -162,7 +243,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             vol.Required(CONF_FAN_MODE_NORMAL, default=normal): pick,
             vol.Required(CONF_FAN_MODE_CIRCULATE, default=circ or normal): pick,
             vol.Required(CONF_FAN_WATTS, default=cur[CONF_FAN_WATTS]): _box(20, 1500, 10),
-            vol.Required(CONF_AC_KW, default=cur[CONF_AC_KW]): _box(0.5, 15, 0.1),
             vol.Required(CONF_FAN_HUMIDITY_MAX, default=cur[CONF_FAN_HUMIDITY_MAX]): _box(30, 90, 1),
         }
         sensor_key = (

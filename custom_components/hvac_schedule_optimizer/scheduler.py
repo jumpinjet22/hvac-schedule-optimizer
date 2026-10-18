@@ -16,7 +16,10 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from . import engine
-from .const import DOMAIN, STORAGE_VERSION
+from .const import DOMAIN, STORAGE_VERSION, run_mode, setpoints_of
+
+MODE_HOLD_S = 3 * 3600  # auto switching keeps a mode at least this long
+MANUAL_MODE_PAUSE_S = 12 * 3600  # and stays away for this long after someone picks a mode by hand
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +38,11 @@ class Scheduler:
     Manual changes: every write here carries a context of its own, so a setpoint
     change with any other context (the app, the wall, the vendor's app) is reported
     to on_manual_change for comfort learning.
+
+    Modes: in cool it writes the cool setpoint, in heat the heat setpoint (when the
+    schedule has heat values), in heat_cool both, never closer than deadband(). Other
+    modes (off, dry, fan only) are left alone. With auto switching opted in, the
+    coordinator asks for heat or cool through async_auto_switch.
     """
 
     def __init__(self, hass: HomeAssistant, entry_id: str, climate_entity: str, default_nodes: list[dict]) -> None:
@@ -56,8 +64,12 @@ class Scheduler:
         self.fan_blocked: Callable[[], str | None] = lambda: None
         self.fan_forced = False
         self.fan_note: str | None = None
-        self.on_manual_change: Callable[[float, float, str], Awaitable[None]] | None = None
+        self.on_manual_change: Callable[..., Awaitable[None]] | None = None
+        self.deadband: Callable[[], float] = lambda: 0.0
         self._own_ctx: deque[str] = deque(maxlen=20)
+        self.mode_switched_at: float | None = None
+        self.manual_mode_at: float | None = None
+        self.mode_note: str | None = None
 
     # ---------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -120,24 +132,31 @@ class Scheduler:
         self._own_ctx.append(ctx.id)
         return ctx
 
+    def _ours(self, ctx) -> bool:
+        return ctx.id in self._own_ctx or bool(ctx.parent_id and ctx.parent_id in self._own_ctx)
+
+    def _echo(self, key: str, value: float) -> bool:
+        """A cloud thermostat reporting our own recent write back with a fresh context."""
+        if not self.last_set or self.last_set.get(key) is None or abs(float(self.last_set[key]) - value) > 1e-6:
+            return False
+        set_at = dt_util.parse_datetime(self.last_set["at"])
+        return bool(set_at and (dt_util.utcnow() - set_at).total_seconds() < 120)
+
     async def _async_state_changed(self, event: Event[EventStateChangedData]) -> None:
         old, new = event.data["old_state"], event.data["new_state"]
-        if old is None or new is None or new.state != "cool" or not self.enabled or self.on_manual_change is None:
+        if old is None or new is None:
             return
-        try:
-            before, after = float(old.attributes["temperature"]), float(new.attributes["temperature"])
-        except (KeyError, TypeError, ValueError):
+        if old.state != new.state:
+            if not self._ours(new.context) and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN) and old.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                self.manual_mode_at = dt_util.utcnow().timestamp()  # someone picked a mode: auto switching backs off
             return
-        if abs(before - after) < 1e-6:
+        if run_mode(new) is None or not self.enabled or self.on_manual_change is None or self._ours(new.context):
             return
-        ctx = new.context
-        if ctx.id in self._own_ctx or (ctx.parent_id and ctx.parent_id in self._own_ctx):
-            return
-        if self.last_set and abs(float(self.last_set["temp"]) - after) < 1e-6:
-            set_at = dt_util.parse_datetime(self.last_set["at"])
-            if set_at and (dt_util.utcnow() - set_at).total_seconds() < 120:
-                return  # a cloud thermostat echoing our own write back
-        await self.on_manual_change(before, after, "ui" if ctx.user_id else "device")
+        source = "ui" if new.context.user_id else "device"
+        for (before, after), side, key in zip(zip(setpoints_of(old), setpoints_of(new)), ("cool", "heat"), ("temp", "heat")):
+            if before is None or after is None or abs(before - after) < 1e-6 or self._echo(key, after):
+                continue
+            await self.on_manual_change(before, after, source, side)
 
     @callback
     def async_stop(self) -> None:
@@ -166,7 +185,12 @@ class Scheduler:
         """Replace the active schedule. The old one is kept for one-tap revert."""
         engine.parse_nodes(nodes)  # validates
         clean = [
-            {"time": engine.hhmm(engine.to_minutes(n["time"])), "temp": n["temp"], **({"fan": True} if n.get("fan") else {})}
+            {
+                "time": engine.hhmm(engine.to_minutes(n["time"])),
+                "temp": n["temp"],
+                **({"heat": n["heat"]} if n.get("heat") is not None else {}),
+                **({"fan": True} if n.get("fan") else {}),
+            }
             for n in nodes
         ]
         clean.sort(key=lambda n: engine.to_minutes(n["time"]))
@@ -199,6 +223,14 @@ class Scheduler:
         now = dt_util.as_local(now or dt_util.now())
         return engine.setpoint_at(self.nodes, now.hour * 60 + now.minute)
 
+    def current_heat(self, now: datetime | None = None) -> float | None:
+        """Heat setpoint the schedule asks for now, or None when the schedule has no heat values."""
+        plan = engine.heat_plan(self.nodes)
+        if not plan:
+            return None
+        now = dt_util.as_local(now or dt_util.now())
+        return engine._step_at(plan, now.hour * 60 + now.minute)
+
     def next_change(self, now: datetime | None = None) -> tuple[datetime, float]:
         now = dt_util.as_local(now or dt_util.now())
         ahead, temp = engine.next_change(self.nodes, now.hour * 60 + now.minute)
@@ -216,6 +248,8 @@ class Scheduler:
             "enabled": self.enabled,
             "auto_apply": self.auto_apply,
             "setpoint_now": self.current_setpoint(),
+            "heat_now": self.current_heat(),
+            "mode_note": self.mode_note,
             "next_change": when.isoformat(),
             "next_temp": temp,
             "climate_entity": self.climate_entity,
@@ -243,32 +277,86 @@ class Scheduler:
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             _LOGGER.warning("%s is unavailable, skipping setpoint change", self.climate_entity)
             return
-        if state.state != "cool":
-            _LOGGER.debug("%s is in mode %s, not cool; leaving it alone", self.climate_entity, state.state)
+        mode = run_mode(state)
+        if mode is None:
+            _LOGGER.debug("%s is in mode %s; leaving it alone", self.climate_entity, state.state)
             return
         await self._async_apply_fan(state, now)
-        temp = self.current_setpoint(now)
         lo, hi = state.attributes.get("min_temp"), state.attributes.get("max_temp")
-        if lo is not None:
-            temp = max(temp, float(lo))
-        if hi is not None:
-            temp = min(temp, float(hi))
-        if state.attributes.get("temperature") is not None and abs(float(state.attributes["temperature"]) - temp) < 1e-6:
-            self.last_set = {"temp": temp, "at": dt_util.utcnow().isoformat(), "changed": False}
+
+        def clamp(t: float) -> float:
+            if lo is not None:
+                t = max(t, float(lo))
+            if hi is not None:
+                t = min(t, float(hi))
+            return t
+
+        cool_now, heat_now = setpoints_of(state)
+        cool = clamp(self.current_setpoint(now))
+        heat = self.current_heat(now)
+        heat = clamp(heat) if heat is not None else None
+        if mode == "cool":
+            data, want = {"temperature": cool}, (cool, None)
+        elif mode == "heat":
+            if heat is None:
+                return  # the schedule has no heat values: the thermostat keeps its own
+            data, want = {"temperature": heat}, (None, heat)
+        else:
+            low = heat if heat is not None else heat_now
+            if low is None:
+                return
+            cool = max(cool, low + self.deadband())  # thermostats refuse a pair closer than their gap
+            data, want = {"target_temp_high": cool, "target_temp_low": low}, (cool, low)
+        record = {"temp": want[0], "heat": want[1], "at": dt_util.utcnow().isoformat()}
+        same = all(
+            w is None or (c is not None and abs(c - w) < 1e-6) for w, c in zip(want, (cool_now, heat_now))
+        )
+        if same:
+            self.last_set = {**record, "changed": False}
             return
         try:
             await self.hass.services.async_call(
                 "climate",
                 "set_temperature",
-                {"entity_id": self.climate_entity, "temperature": temp},
+                {"entity_id": self.climate_entity, **data},
                 blocking=True,
                 context=self._context(),
             )
         except HomeAssistantError as err:
-            _LOGGER.warning("Could not set %s to %s: %s", self.climate_entity, temp, err)
+            _LOGGER.warning("Could not set %s to %s: %s", self.climate_entity, data, err)
             return
-        self.last_set = {"temp": temp, "at": dt_util.utcnow().isoformat(), "changed": True}
+        self.last_set = {**record, "changed": True}
         await self._async_save()
+
+    async def async_auto_switch(self, want: str | None, reason: str = "") -> None:
+        """Switch the thermostat to heat or cool when the plan needs it, with safeguards.
+
+        Holds a mode at least MODE_HOLD_S, backs off for MANUAL_MODE_PAUSE_S after someone
+        picks a mode by hand, and never touches a thermostat that is off.
+        """
+        state = self.hass.states.get(self.climate_entity)
+        if not self.enabled or want not in ("heat", "cool") or state is None or state.state not in ("heat", "cool"):
+            return
+        if state.state == want:
+            return
+        now = dt_util.utcnow().timestamp()
+        if self.manual_mode_at and now - self.manual_mode_at < MANUAL_MODE_PAUSE_S:
+            self.mode_note = "Mode was changed by hand, so switching is paused for 12 hours"
+            return
+        if self.mode_switched_at and now - self.mode_switched_at < MODE_HOLD_S:
+            return
+        try:
+            await self.hass.services.async_call(
+                "climate", "set_hvac_mode", {"entity_id": self.climate_entity, "hvac_mode": want},
+                blocking=True, context=self._context(),
+            )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Could not switch %s to %s: %s", self.climate_entity, want, err)
+            return
+        self.mode_switched_at = now
+        self.mode_note = f"Switched to {want}{': ' + reason if reason else ''}"
+        await self._async_apply_current()
+        self._notify()
 
     async def _async_apply_fan(self, state, now: datetime | None = None) -> None:
         cfg = self.fan_config()

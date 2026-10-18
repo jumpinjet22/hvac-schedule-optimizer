@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.5.0-beta.1";
+const CARD_VERSION = "0.6.0-beta.1";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -25,7 +25,7 @@ const STYLE = `
 :host { display: block; }
 ha-card { overflow: hidden; --hso-accent: var(--primary-color, #03a9f4); --hso-good: var(--success-color, #43a047);
   --hso-warn: var(--warning-color, #f9a825); --hso-bad: var(--error-color, #e53935);
-  --hso-cool: #4aa3ff; --hso-sun: #ffb74d; --hso-muted: var(--secondary-text-color, #727272); }
+  --hso-cool: #4aa3ff; --hso-sun: #ffb74d; --hso-heat: #ff7043; --hso-muted: var(--secondary-text-color, #727272); }
 .wrap { padding: 16px 16px 14px; position: relative; }
 .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .title { font-size: 1.15rem; font-weight: 500; color: var(--primary-text-color); line-height: 1.2; }
@@ -114,9 +114,10 @@ const toMin = (s) => {
   return Number(h) * 60 + Number(m);
 };
 
-function stepSeries(nodes, lm) {
-  if (!nodes || !nodes.length) return lm.map(() => null);
-  const n = nodes.map((x) => [toMin(x.time), Number(x.temp)]).sort((a, b) => a[0] - b[0]);
+function stepSeries(nodes, lm, key = "temp") {
+  const have = (nodes || []).filter((x) => x[key] !== undefined && x[key] !== null);
+  if (!have.length) return lm.map(() => null);
+  const n = have.map((x) => [toMin(x.time), Number(x[key])]).sort((a, b) => a[0] - b[0]);
   return lm.map((m) => {
     let t = n[n.length - 1][1];
     for (const [nm, nt] of n) if (nm <= m) t = nt;
@@ -234,7 +235,9 @@ class HvacScheduleCard extends HTMLElement {
   _render() {
     const root = this.shadowRoot;
     if (!root) return;
-    const title = (this._config && this._config.title) || "Cooling schedule";
+    const mode0 = this._state && this._state.result && this._state.result.mode;
+    const title = (this._config && this._config.title) ||
+      (mode0 === "heat" ? "Heating schedule" : mode0 === "heat_cool" ? "Heating and cooling" : "Cooling schedule");
     root.innerHTML = `<style>${STYLE}</style><ha-card><div class="wrap ${this._busy ? "spin" : ""}"></div></ha-card>`;
     const wrap = root.querySelector(".wrap");
 
@@ -258,9 +261,12 @@ class HvacScheduleCard extends HTMLElement {
     const shown = vsActive !== null && vsActive !== undefined ? vsActive : change;
     const shownLabel = vsActive !== null && vsActive !== undefined ? "vs active" : "vs baseline";
     const when = sch.next_change ? new Date(sch.next_change) : null;
-    const nextTxt = when
-      ? `${fmtClock(when.getHours() * 60 + when.getMinutes())} to ${f1(sch.next_temp)}${unit}`
-      : "";
+    const mode = r.mode || "cool";
+    const nextNode = when ? (sch.nodes || []).find((x) => toMin(x.time) === when.getHours() * 60 + when.getMinutes()) : null;
+    const spText = (cool, heat) =>
+      mode === "heat" ? (heat === null || heat === undefined ? "-" : `heat ${f1(heat)}${unit}`)
+      : mode === "heat_cool" && heat !== null && heat !== undefined ? `${f1(heat)}\u2013${f1(cool)}${unit}`
+      : `${f1(cool)}${unit}`;
     const updated = r.generated_at ? new Date(r.generated_at) : null;
 
     wrap.innerHTML = `
@@ -275,9 +281,9 @@ class HvacScheduleCard extends HTMLElement {
       </div>
       <div class="stats">
         <div class="stat"><div class="k">Indoor now</div><div class="v">${f1(nowIndoor)}<small>${unit}</small></div>
-          <div class="n">target ${f1(sch.setpoint_now)}${unit}</div></div>
+          <div class="n">target ${spText(sch.setpoint_now, sch.heat_now)}</div></div>
         <div class="stat"><div class="k">Next change</div><div class="v">${when ? fmtClock(when.getHours() * 60 + when.getMinutes()).replace(/ (AM|PM)/, "<small>$1</small>") : "-"}</div>
-          <div class="n">${when ? "set to " + f1(sch.next_temp) + unit : ""}</div></div>
+          <div class="n">${when ? "set to " + spText(sch.next_temp, nextNode ? nextNode.heat : null) : ""}</div></div>
         <div class="stat"><div class="k">Proposed</div>
           <div class="v ${shown === null || shown === undefined ? "" : shown <= 0 ? "good" : "bad"}">${
             shown === null || shown === undefined ? "-" : (shown > 0 ? "+" : "") + f1(shown) + "<small>%</small>"
@@ -318,6 +324,9 @@ class HvacScheduleCard extends HTMLElement {
     else if (fan && fan.enabled && !fan.learned_rooms)
       lines.push(["warn", `Fan control is on, but no room has learned what the fan does yet (${f1(fan.history_fan_only_hours)} of 4 fan-only hours in history). Run the fan on circulate for a few evenings so it can learn.`]);
     if (sch.fan_note) lines.push(["warn", `Fan held at normal: ${sch.fan_note}.`]);
+    if (sch.mode_note) lines.push(["warn", `${sch.mode_note}.`]);
+    if (r.comfort && r.comfort.heats && !r.heat_learned && r.status !== "error")
+      lines.push(["warn", "Heating has not run enough in the recent history to learn it yet. It learns as the heat runs (about 8 hours)."]);
     const gap = r.indoor_source && r.indoor_source.thermostat_gap;
     if (gap !== null && gap !== undefined && Math.abs(gap) >= (unit === "\u00b0C" ? 0.6 : 1))
       lines.push(["warn", `Your indoor sensor reads ${f1(Math.abs(gap))}${unit} ${gap < 0 ? "below" : "above"} the thermostat, and the thermostat controls to its own reading. The learned switching points account for it.`]);
@@ -325,14 +334,17 @@ class HvacScheduleCard extends HTMLElement {
     msgs.innerHTML = lines.map(([t, m]) => `<div class="msg ${t === "bad" ? "bad" : ""}">${this._esc(m)}</div>`).join("");
 
     const nodes = wrap.querySelector(".nodes");
+    const pillTemp = (n) =>
+      mode === "heat" ? (n.heat !== undefined ? `heat ${f1(n.heat)}${unit}` : `${f1(n.temp)}${unit}`)
+      : `${f1(n.temp)}${unit}${mode === "heat_cool" && n.heat !== undefined ? ` <span>\u00b7 heat ${f1(n.heat)}${unit}</span>` : ""}`;
     const pills = (list) =>
-      (list || []).map((n) => `<span class="pill">${fmtClock(toMin(n.time))} <span>\u2192</span> ${f1(n.temp)}${unit}${n.fan ? ' <span title="Fan circulates until the next change">\u00b7 fan</span>' : ""}</span>`).join("") ||
+      (list || []).map((n) => `<span class="pill">${fmtClock(toMin(n.time))} <span>\u2192</span> ${pillTemp(n)}${n.fan ? ' <span title="Fan circulates until the next change">\u00b7 fan</span>' : ""}</span>`).join("") ||
       `<span class="pill"><span>none</span></span>`;
     const proposed = r.best && r.best.nodes;
     nodes.innerHTML = `<div class="col"><h4>Active</h4>${pills(sch.nodes)}</div>
       <div class="col prop"><h4>Proposed</h4>${proposed ? pills(proposed) : '<span class="pill"><span>none</span></span>'}</div>`;
 
-    const canApply = !!(r.ok_to_apply && proposed && JSON.stringify(proposed) !== JSON.stringify(sch.nodes.map((n) => ({ time: n.time, temp: Number(n.temp), ...(n.fan ? { fan: true } : {}) }))));
+    const canApply = !!(r.ok_to_apply && proposed && JSON.stringify(proposed) !== JSON.stringify(sch.nodes.map((n) => ({ time: n.time, temp: Number(n.temp), ...(n.heat !== undefined ? { heat: Number(n.heat) } : {}), ...(n.fan ? { fan: true } : {}) }))));
     const actions = wrap.querySelector(".actions");
     actions.innerHTML = `
       <button class="b primary" data-a="apply" ${canApply ? "" : "disabled"}>Apply proposed</button>
@@ -377,7 +389,10 @@ class HvacScheduleCard extends HTMLElement {
           })
           .join("")
       : "";
-    node.innerHTML = `<h4>Predicted AC runtime</h4><div class="rtgrid">${cells.join("")}</div>${
+    const what = rt.kind === "heat" ? "heating" : "AC";
+    if (rt.kind !== "heat" && cur && cur.heat_hours !== undefined)
+      cells.push(stat("Heating, next 24h", `${hrs(cur.heat_hours)}${prop && prop.heat_hours !== undefined ? ` \u2192 ${hrs(prop.heat_hours)}` : ""}`));
+    node.innerHTML = `<h4>Predicted ${what} runtime</h4><div class="rtgrid">${cells.join("")}</div>${
       hasBars
         ? `<div class="bars">${bars}</div><div class="barlab"><span>${fmtHour(start * 60)}</span><span>${fmtHour(((start + 6) % 24) * 60)}</span><span>${fmtHour(((start + 12) % 24) * 60)}</span><span>${fmtHour(((start + 18) % 24) * 60)}</span><span>${fmtHour(((start + 24) % 24) * 60)}</span></div>
            <div class="sub" style="margin-top:6px">Minutes per hour, grey is ${rt.active ? "active" : "baseline"}, blue is proposed. ${prop ? "Proposed: " + extra(prop) + "." : ""}</div>`
@@ -390,6 +405,11 @@ class HvacScheduleCard extends HTMLElement {
     const c = r.control;
     if (c && c.source === "learned")
       bits.push(`Your thermostat keeps cooling until about ${f1(Math.abs(c.used_off_at))}${unit} ${c.used_off_at < 0 ? "below" : "above"} its setpoint and starts again ${f1(Math.abs(c.used_on_at))}${unit} ${c.used_on_at < 0 ? "below" : "above"} it (learned from ${c.stops} cycles)${c.setpoint_shift > 0 ? ", so proposals use setpoint numbers about " + f1(c.setpoint_shift) + unit + " higher for the same comfort" : ""}.`);
+    const hc = r.heat_control;
+    if (hc && hc.source === "learned")
+      bits.push(`The heat starts about ${f1(Math.abs(hc.used_on_at))}${unit} ${hc.used_on_at < 0 ? "below" : "above"} its setpoint and stops ${f1(Math.abs(hc.used_off_at))}${unit} ${hc.used_off_at < 0 ? "below" : "above"} it (learned from ${hc.stops} cycles).`);
+    if (r.heat_learned && r.model && r.model.h)
+      bits.push(`The ${({ furnace: "furnace", electric: "electric heat", heat_pump: "heat pump", dual_fuel: "heat" })[r.heat_kind] || "heat"} warms the house about ${f1(r.model.h)}${unit} an hour while it runs.`);
     const res = r.residual;
     if (res && res.used && res.coef) {
       const parts = [];
@@ -411,7 +431,8 @@ class HvacScheduleCard extends HTMLElement {
     let cond = "";
     if (rule.cond && rule.cond.outdoor_min !== undefined) cond = ` on days over ${f1(rule.cond.outdoor_min)}${unit}`;
     if (rule.cond && rule.cond.humidity_min !== undefined) cond = ` when humidity is over ${f1(rule.cond.humidity_min)}%`;
-    return `${who} \u2264 ${f1(rule.max)}${unit}, ${when}${cond}`;
+    if (rule.cond && rule.cond.outdoor_max !== undefined) cond = ` on days under ${f1(rule.cond.outdoor_max)}${unit}`;
+    return `${who} ${rule.side === "min" ? "\u2265" : "\u2264"} ${f1(rule.max)}${unit}, ${when}${cond}`;
   }
 
   _learned(node, r, unit) {
@@ -424,8 +445,9 @@ class HvacScheduleCard extends HTMLElement {
       `<span class="rule" title="Learned from ${rule.changes} manual changes on ${rule.days} days">${this._esc(this._ruleText(rule, r, unit))} <span>\u00b7 ${rule.days} days</span><button data-forget="${this._esc(rule.id)}" title="Forget this">\u00d7</button></span>`);
     const pend = cl.pending.map((rule) =>
       `<span class="rule pending" title="Needs another day like this before it is used">${this._esc(this._ruleText(rule, r, unit))} <span>\u00b7 watching</span></span>`);
-    const notes = cl.notes.map((n) =>
-      `<div class="note">You turned it up around ${fmtHour(n.hour * 60)} on ${n.days} days. It may be cooling more than you need then.</div>`);
+    const notes = cl.notes.map((n) => n.side === "heat"
+      ? `<div class="note">You turned the heat down around ${fmtHour(n.hour * 60)} on ${n.days} days. It may be heating more than you need then.</div>`
+      : `<div class="note">You turned it up around ${fmtHour(n.hour * 60)} on ${n.days} days. It may be cooling more than you need then.</div>`);
     node.innerHTML = `<h4>Learned comfort</h4>${chips.join("")}${pend.join("")}${notes.join("")}
       <div><button class="linkbtn" data-reset="1">Forget everything learned</button></div>`;
     node.querySelectorAll("[data-forget]").forEach((b) =>
@@ -442,9 +464,14 @@ class HvacScheduleCard extends HTMLElement {
       `<span><i style="border-color:var(--hso-sun)"></i>Outdoor</span>`,
       `<span><i style="border-color:var(--primary-text-color)"></i>Indoor${acc(r.series.accuracy)}</span>`,
       ...(planned ? [`<span><i class="dash" style="border-color:var(--hso-muted);opacity:.6"></i>Predicted earlier</span>`] : []),
-      `<span><i style="border-color:var(--hso-muted)"></i>${hasActive ? "Active" : "Baseline"} setpoint</span>`,
-      `<span><i class="dash" style="border-color:var(--hso-accent)"></i>Proposed setpoint</span>`,
-      `<span><i class="box" style="background:var(--hso-cool)"></i>AC running</span>`,
+      ...(r.comfort && r.comfort.cools === false ? [] : [
+        `<span><i style="border-color:var(--hso-muted)"></i>${hasActive ? "Active" : "Baseline"} setpoint</span>`,
+        `<span><i class="dash" style="border-color:var(--hso-accent)"></i>Proposed setpoint</span>`,
+        `<span><i class="box" style="background:var(--hso-cool)"></i>AC running</span>`]),
+      ...(r.comfort && r.comfort.heats ? [
+        `<span><i style="border-color:var(--hso-heat)"></i>Heat setpoint</span>`,
+        `<span><i class="dash" style="border-color:var(--hso-heat)"></i>Proposed heat</span>`,
+        `<span><i class="box" style="background:var(--hso-heat)"></i>Heating</span>`] : []),
       ...(r.series.rooms || []).map((room, k) => {
         const tag = room.trusted ? ROOM_WHEN[room.when] || room.when : "learning";
         const off = this._roomHidden(room);
@@ -467,7 +494,11 @@ class HvacScheduleCard extends HTMLElement {
     const pad = { l: 38, r: 40, t: 12, b: 22 };
     const acH = 9, acGap = 4;
     const fanRow = [].concat(s.fan_actual || [], (s.fan && (s.fan.proposed || s.fan.active)) || []).some((v) => v);
-    const acArea = acH * (fanRow ? 3 : 2) + acGap * (fanRow ? 2 : 1) + 10;
+    const heats = !!(r.comfort && r.comfort.heats);
+    const cools = !(r.comfort && r.comfort.cools === false);
+    const heatRow = heats || [].concat(s.heat_actual || []).some((v) => v);
+    const rowsN = (cools ? 2 : 0) + (heatRow ? 2 : 0) + (fanRow ? 1 : 0) || 1;
+    const acArea = acH * rowsN + acGap * (rowsN - 1) + 10;
     const px0 = pad.l, px1 = W - pad.r;
     const py0 = pad.t, py1 = H - pad.b - acArea;
     const X = (i) => px0 + ((px1 - px0) * i) / (n - 1);
@@ -475,9 +506,14 @@ class HvacScheduleCard extends HTMLElement {
     const activeNodes = r.active ? sch.nodes : null;
     const lm = s.local_minutes;
     const activeSp = stepSeries(sch.nodes, lm);
-    const propSp = r.best ? stepSeries(r.best.nodes, lm) : null;
+    const propSp = r.best && cools ? stepSeries(r.best.nodes, lm) : null;
+    const heatSp = heats ? stepSeries(sch.nodes, lm, "heat") : null;
+    const heatPast = s.heat_setpoint_actual || [];
+    const heatRef = heatSp && heatSp.some((v) => v !== null) ? heatSp.map((v, i) => (i < s.now_index && heatPast[i] !== null && heatPast[i] !== undefined ? heatPast[i] : v)) : (heats ? heatPast : null);
+    const propHeat = heats && r.best ? stepSeries(r.best.nodes, lm, "heat") : null;
     const baseSp = !activeNodes && r.baseline ? stepSeries(r.baseline.nodes, lm) : null;
-    const refSp = activeSp; // the "current" line is the integration's active schedule
+    const refSp = cools ? activeSp : lm.map(() => null); // the "current" line is the integration's active schedule
+    const limitMin = s.limit_min || lm.map(() => null);
     const c = r.comfort;
     const limit = s.limit || lm.map((m) => {
       const h = m / 60;
@@ -491,6 +527,7 @@ class HvacScheduleCard extends HTMLElement {
     const roomFuture = (room) => room.predicted.proposed || room.predicted.active || room.predicted.baseline || [];
     const ivals = [].concat(
       s.indoor_actual, s.indoor.proposed || [], s.indoor.active || s.indoor.baseline || [], refSp, propSp || [], limit,
+      limitMin, heatRef || [], propHeat || [],
       s.indoor_planned || [],
       ...rooms.map((room) => room.actual.concat(roomFuture(room), room.planned || []))
     ).filter((v) => v !== null && v !== undefined);
@@ -547,8 +584,11 @@ class HvacScheduleCard extends HTMLElement {
       el("path", { d, fill: "none", stroke: "#ffb74d", "stroke-width": 1.4, "stroke-opacity": 0.75, "stroke-linejoin": "round" }, svg);
     }
 
-    // comfort limit
+    // comfort limits: red stay-below (cooling), blue stay-above (heating)
     this._line(svg, limit, X, Yi, { stroke: "#e53935", "stroke-width": 1.2, "stroke-opacity": 0.55, "stroke-dasharray": "1 3" }, true);
+    this._line(svg, limitMin, X, Yi, { stroke: "#1e88e5", "stroke-width": 1.2, "stroke-opacity": 0.6, "stroke-dasharray": "1 3" }, true);
+    if (heatRef) this._line(svg, heatRef, X, Yi, { stroke: "var(--hso-heat, #ff7043)", "stroke-opacity": 0.7, "stroke-width": 1.8 }, true);
+    if (propHeat) this._line(svg, propHeat, X, Yi, { stroke: "var(--hso-heat, #ff7043)", "stroke-width": 2, "stroke-dasharray": "6 4" }, true);
 
     // setpoints
     this._line(svg, refSp, X, Yi, { stroke: "currentColor", "stroke-opacity": 0.5, "stroke-width": 1.8 }, true);
@@ -577,28 +617,28 @@ class HvacScheduleCard extends HTMLElement {
     if (futureRef) this._line(svg, futureRef, X, Yi, { stroke: "var(--primary-text-color, #212121)", "stroke-width": 1.4, "stroke-opacity": 0.45, "stroke-dasharray": "2 3" }, false);
     if (s.indoor.proposed) this._line(svg, s.indoor.proposed, X, Yi, { stroke: "var(--hso-accent, #03a9f4)", "stroke-width": 2.2 }, false);
 
-    // AC strips
-    const rowY = [py1 + 10, py1 + 10 + acH + acGap];
+    // equipment strips: AC (now / proposed), heat (now / proposed), fan
     const bw = (px1 - px0) / (n - 1);
-    for (let i = 0; i < n; i++) {
-      const past = s.ac_actual[i];
-      const fa = (s.ac.active || s.ac.baseline || [])[i];
-      const fp = (s.ac.proposed || [])[i];
-      const a = i < s.now_index ? past : fa;
-      if (a) el("rect", { x: X(i) - bw / 2, y: rowY[0], width: bw + 0.4, height: acH, rx: 1.5, fill: "#4aa3ff", "fill-opacity": 0.25 + 0.7 * Math.min(1, a) }, svg);
-      if (i >= s.now_index && fp) el("rect", { x: X(i) - bw / 2, y: rowY[1], width: bw + 0.4, height: acH, rx: 1.5, fill: "var(--hso-accent, #03a9f4)", "fill-opacity": 0.85 }, svg);
-    }
     const lab = (txt, y) => { const t = el("text", { x: px0 - 6, y: y + 7.5, "text-anchor": "end" }, svg); t.textContent = txt; };
-    lab("AC", rowY[0]); lab("new", rowY[1]);
-    if (fanRow) {
-      const fy = rowY[1] + acH + acGap;
-      const fanFuture = s.fan.proposed || s.fan.active || s.fan.baseline || [];
+    let ry = py1 + 10;
+    const strip = (label, past, fut, color, solid) => {
       for (let i = 0; i < n; i++) {
-        const v = i < s.now_index ? (s.fan_actual || [])[i] : fanFuture[i];
-        if (v) el("rect", { x: X(i) - bw / 2, y: fy, width: bw + 0.4, height: acH, rx: 1.5, fill: "#26a69a", "fill-opacity": i < s.now_index ? 0.3 + 0.6 * Math.min(1, v) : 0.85 }, svg);
+        const v = i < s.now_index ? (past ? past[i] : null) : fut[i];
+        if (v) el("rect", { x: X(i) - bw / 2, y: ry, width: bw + 0.4, height: acH, rx: 1.5, fill: color, "fill-opacity": i < s.now_index || !solid ? 0.25 + 0.7 * Math.min(1, v) : 0.85 }, svg);
       }
-      lab("fan", fy);
+      lab(label, ry);
+      ry += acH + acGap;
+    };
+    if (cools) {
+      strip("AC", s.ac_actual, s.ac.active || s.ac.baseline || [], "#4aa3ff", false);
+      strip("new", null, s.ac.proposed || [], "var(--hso-accent, #03a9f4)", true);
     }
+    if (heatRow) {
+      const hf = (s.heat && (s.heat.active || s.heat.baseline)) || [];
+      strip("heat", s.heat_actual || [], hf, "#ff7043", false);
+      strip("new", null, (s.heat && s.heat.proposed) || [], "#ff7043", true);
+    }
+    if (fanRow) strip("fan", s.fan_actual || [], s.fan.proposed || s.fan.active || s.fan.baseline || [], "#26a69a", true);
 
     // now marker
     el("line", { x1: xNow, x2: xNow, y1: py0 - 4, y2: py1 + acArea, stroke: "var(--primary-text-color, #212121)", "stroke-opacity": 0.5, "stroke-width": 1 }, svg);
@@ -628,10 +668,13 @@ class HvacScheduleCard extends HTMLElement {
         const v = future ? roomFuture(room)[i] : room.actual[i];
         if (v !== null && v !== undefined) rows.push([room.name, withPred(v, (room.planned || [])[i])]);
       });
-      rows.push(["Setpoint", `${f1(refSp[i])}${unit}`]);
+      if (cools) rows.push(["Setpoint", `${f1(refSp[i])}${unit}`]);
       if (propSp) rows.push(["Proposed", `${f1(propSp[i])}${unit}`]);
-      const ac = future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i];
-      rows.push(["AC", ac === null || ac === undefined ? "-" : ac >= 0.5 ? "on" : "off"]);
+      if (heatRef) rows.push(["Heat setpoint", `${f1(heatRef[i])}${unit}`]);
+      if (propHeat) rows.push(["Proposed heat", `${f1(propHeat[i])}${unit}`]);
+      const onOff = (v) => (v === null || v === undefined ? "-" : v >= 0.5 ? "on" : v > 0 ? `${Math.round(v * 100)}%` : "off");
+      if (cools) rows.push(["AC", onOff(future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i])]);
+      if (heatRow) rows.push(["Heat", onOff(future ? ((s.heat && (s.heat.active || s.heat.baseline)) || [])[i] : (s.heat_actual || [])[i])]);
       const man = (s.manual || []).find((m) => m.i === i);
       if (man) rows.push(["You changed", `${f1(man.from)} \u2192 ${f1(man.to)}${unit}`]);
       if (fanRow) {
