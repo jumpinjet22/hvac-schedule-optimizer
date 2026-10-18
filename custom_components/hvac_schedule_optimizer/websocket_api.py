@@ -28,6 +28,7 @@ def _payload(entry) -> dict[str, Any]:
         "entry_id": entry.entry_id,
         "result": data,
         "schedule": rt.scheduler.snapshot(),
+        "learn": rt.coordinator.learn_enabled,
     }
 
 
@@ -37,6 +38,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_apply)
     websocket_api.async_register_command(hass, ws_revert)
     websocket_api.async_register_command(hass, ws_toggle)
+    websocket_api.async_register_command(hass, ws_comfort)
 
 
 @websocket_api.websocket_command(
@@ -60,7 +62,7 @@ def ws_state(hass: HomeAssistant, connection: websocket_api.ActiveConnection, ms
 async def ws_optimize(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
     try:
         entry = _find_entry(hass, msg.get("climate_entity"))
-        await entry.runtime_data.coordinator.async_refresh()
+        await entry.runtime_data.coordinator.async_plan("manual")
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "failed", str(err))
         return
@@ -75,9 +77,8 @@ async def ws_optimize(hass: HomeAssistant, connection: websocket_api.ActiveConne
 async def ws_apply(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
     try:
         entry = _find_entry(hass, msg.get("climate_entity"))
+        # Re-runs as a planning run, so the card's "active" trace matches what is now running.
         await entry.runtime_data.coordinator.async_apply()
-        # Re-run so the card's "active" trace and savings numbers match what is now running.
-        await entry.runtime_data.coordinator.async_refresh()
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "failed", str(err))
         return
@@ -92,8 +93,7 @@ async def ws_apply(hass: HomeAssistant, connection: websocket_api.ActiveConnecti
 async def ws_revert(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
     try:
         entry = _find_entry(hass, msg.get("climate_entity"))
-        await entry.runtime_data.scheduler.async_revert()
-        await entry.runtime_data.coordinator.async_refresh()
+        await entry.runtime_data.coordinator.async_revert()
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "failed", str(err))
         return
@@ -103,7 +103,7 @@ async def ws_revert(hass: HomeAssistant, connection: websocket_api.ActiveConnect
 @websocket_api.websocket_command(
     {
         vol.Required("type"): f"{DOMAIN}/toggle",
-        vol.Required("what"): vol.In(["run", "auto_apply"]),
+        vol.Required("what"): vol.In(["run", "auto_apply", "learn"]),
         vol.Required("value"): bool,
         vol.Optional("climate_entity"): str,
     }
@@ -116,8 +116,34 @@ async def ws_toggle(hass: HomeAssistant, connection: websocket_api.ActiveConnect
         sched = entry.runtime_data.scheduler
         if msg["what"] == "run":
             await sched.async_set_enabled(msg["value"])
+        elif msg["what"] == "learn":
+            await entry.runtime_data.coordinator.async_set_learn(msg["value"])
         else:
             await sched.async_set_auto_apply(msg["value"])
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], _payload(entry))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/comfort",
+        vol.Required("action"): vol.In(["forget", "reset"]),
+        vol.Optional("rule_id"): str,
+        vol.Optional("climate_entity"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_comfort(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    try:
+        entry = _find_entry(hass, msg.get("climate_entity"))
+        coordinator = entry.runtime_data.coordinator
+        if msg["action"] == "reset":
+            await coordinator.async_reset_comfort()
+        elif msg.get("rule_id"):
+            await coordinator.async_forget_rule(msg["rule_id"])
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "failed", str(err))
         return

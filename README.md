@@ -7,7 +7,7 @@ its model actually matches reality, then designs a daily schedule that uses less
 while staying inside comfort limits you set. It also runs the schedule itself, so you do not
 need another scheduler integration.
 
-> Version 0.2. Cooling only. Single thermostat per entry. Includes a dashboard card.
+> Version 0.5. Cooling only. Single thermostat per entry. Includes a dashboard card.
 
 ## How it works
 
@@ -19,13 +19,41 @@ need another scheduler integration.
    `dTin/dt = k*(Tout - Tin) + g*Sun + q - c*AC_on`
 
    (leakiness, solar gain, steady internal heat, and how fast your AC pulls the house down).
-3. **Checks the model.** It replays the last week with your real setpoints and compares the
+3. **Learns where your thermostat really switches.** Many thermostats (especially ones on
+   remote or averaged sensors) keep cooling well below the setpoint on the reading used here.
+   The start and stop points are read from every AC cycle in history, and used only if they
+   replay your real runtime better than the configured hysteresis.
+4. **Learns what the simple model misses**: heat the house holds after a sunny afternoon, and
+   an AC losing cooling on very hot days. This correction is checked on the last two days it
+   did not learn from and is only used if it predicts them better.
+5. **Checks the model.** It replays the last week with your real setpoints and compares the
    AC runtime it predicts against what really happened. If they disagree by more than 30%,
    the proposal is marked "needs review" and will not be applied automatically.
-4. Simulates a few thousand candidate daily schedules (day and night setpoints, wake and
-   sleep times, and an optional afternoon coast) against the next 24 hours of forecast,
-   discards any that break your comfort limits, and picks the cheapest.
-5. The active schedule is run by this integration: it sets the thermostat at each node time.
+6. Simulates a few thousand day/night schedules against the next 24 hours of forecast, then
+   refines the best ones freely: moving, nudging, adding or dropping one change at a time (up
+   to 6 changes a day, at least an hour apart). This is how it finds pre-cooling before a hot
+   afternoon the AC cannot keep up with. Anything that breaks a comfort limit is discarded and
+   the cheapest is proposed. A new proposal only replaces the previous one if it is clearly
+   better, so it does not flip between refreshes.
+7. The active schedule is run by this integration: it sets the thermostat at each node time.
+
+It re-runs every 15 minutes so the chart keeps up with the clock. Only the daily run time can
+auto-apply.
+
+### Learning from your changes
+
+When you change the setpoint yourself (in the app or at the wall) while the schedule is running,
+the integration keeps the change together with what the house was doing: every room and whether
+it was warming, outdoor temperature, humidity, and recent AC runtime. It then works out the likely
+reason for a turn-down: a room running warm, sticky air, a hot day, or just that time of day.
+
+- It needs the same reason on **2 days within a week** (or 3 within two weeks) before it uses it.
+- Learned limits only ever **tighten** the limits you set, never by more than 3 °F (1.5 °C).
+- They fade if you stop making the change, and turning it back up counts against them.
+- A change you undo within 10 minutes is ignored, and so are jumps over 5 °F.
+- The card lists what it learned. Tap × to forget one, or use **Forget everything learned**
+  (or the `hvac_schedule_optimizer.reset_learned_comfort` service). The **Learn from my
+  changes** switch turns it off.
 
 The savings number is a relative compressor-energy estimate, not kWh. Judge the real effect
 by watching AC runtime over a few days.
@@ -90,6 +118,7 @@ folder and restart.
 | `sensor.*_model_match` | Predicted over actual AC runtime. Near 1.0 is good. |
 | `switch.*_run_schedule` | On: this integration sets the thermostat at each node time. |
 | `switch.*_auto_apply_optimizer` | On: the daily run replaces the active schedule when the model is trusted. |
+| `switch.*_learn_from_my_changes` | On: manual setpoint changes are kept and repeated turn-downs tighten the comfort limits. |
 | `button.*_optimize_now` | Run the optimizer immediately. |
 | `button.*_apply_proposed_schedule` | Make the proposal the active schedule (refused if the model is not trusted). |
 | `button.*_revert_schedule` | Go back to the previous schedule. |
@@ -117,7 +146,11 @@ title: Cooling schedule                          # optional
 
 It shows 24 hours of history and the next 24 hours on one chart: outdoor temperature behind
 everything, your indoor temperature, the active schedule, the proposed schedule (dashed), your
-comfort limit, and when the AC runs (and would run). Hover or touch the chart for exact values.
+comfort limit, and when the AC runs (and would run). On the past side, faint dashed lines show
+what the house and each room were predicted to do by the planning run that day, next to what
+really happened, and the legend shows each one's average miss (for example `±0.4°`). Small
+markers show your manual setpoint changes. Hover or touch the chart for exact values,
+including how far each reading was from its prediction.
 Under the chart is a runtime panel: AC hours over the last 24h, predicted hours for the next 24h under your active and proposed schedules, and minutes of runtime per hour for each. Below that are the active and proposed schedule times, **Apply proposed**, **Optimize now**,
 **Revert**, and the Run and Auto apply switches. Buttons and switches need an admin user.
 
@@ -135,6 +168,9 @@ If the card does not show up after installing, restart Home Assistant and hard r
 
 - The scheduler writes the setpoint only at node times (and once at startup or when enabled),
   so a manual change at the thermostat holds until the next node.
+- Turn off the thermostat's own built-in schedule too: its changes would look like yours to the
+  comfort learning.
+- Planning forecasts (14 days) and your manual changes (60 days) are stored in `.storage`.
 - It only acts while the thermostat is in `cool` mode.
 - Setpoints are clamped to the thermostat's own min and max.
 - Schedules are stored in `.storage` and survive restarts. The previous schedule is always kept.

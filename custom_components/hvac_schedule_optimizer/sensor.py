@@ -107,6 +107,17 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
             "predicted_ac_hours_per_day": (_data(c).get("validation") or {}).get("predicted_hours"),
             "actual_ac_hours_per_day": (_data(c).get("validation") or {}).get("actual_hours"),
             "days_checked": (_data(c).get("validation") or {}).get("days"),
+            "indoor_rmse": (_data(c).get("validation") or {}).get("indoor_rmse"),
+            "control_off_at": (_data(c).get("control") or {}).get("used_off_at"),
+            "control_on_at": (_data(c).get("control") or {}).get("used_on_at"),
+            "control_source": (_data(c).get("control") or {}).get("source"),
+            "residual_used": (_data(c).get("residual") or {}).get("used"),
+            "residual_coef": (_data(c).get("residual") or {}).get("coef"),
+            "forecast_accuracy": ((_data(c).get("series") or {}).get("accuracy")),
+            "learned_comfort": [
+                {k: r.get(k) for k in ("id", "max", "start", "end", "cond", "days")}
+                for r in (_data(c).get("comfort_learned") or {}).get("rules", [])
+            ],
             "note": "Predicted over actual AC runtime for recent days. Near 1.0 means the house model is trustworthy.",
         },
     ),

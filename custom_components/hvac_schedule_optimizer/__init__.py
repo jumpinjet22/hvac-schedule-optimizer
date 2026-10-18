@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.4.0-beta.2"
+CARD_VERSION = "0.5.0-beta.1"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 SERVICE_SET_SCHEDULE = "set_schedule"
+SERVICE_RESET_COMFORT = "reset_learned_comfort"
 
 _NODE = vol.Schema(
     {
@@ -68,8 +69,18 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             raise HomeAssistantError("No matching HVAC Schedule Optimizer entry is loaded.")
         for entry in targets:
             await entry.runtime_data.scheduler.async_set_nodes(call.data["nodes"], source="manual")
+            await entry.runtime_data.coordinator.async_plan("schedule")
+
+    async def _reset_comfort(call: ServiceCall) -> None:
+        wanted = call.data.get("climate_entity")
+        for entry in hass.config_entries.async_loaded_entries(DOMAIN):
+            if not wanted or entry.data[CONF_CLIMATE] == wanted:
+                await entry.runtime_data.coordinator.async_reset_comfort()
 
     hass.services.async_register(DOMAIN, SERVICE_SET_SCHEDULE, _set_schedule, schema=_SET_SCHEDULE)
+    hass.services.async_register(
+        DOMAIN, SERVICE_RESET_COMFORT, _reset_comfort, schema=vol.Schema({vol.Optional("climate_entity"): cv.entity_id})
+    )
     websocket_api.async_register(hass)
 
     # Serve the dashboard card from inside the integration and load it on every frontend,
@@ -107,8 +118,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
     scheduler = Scheduler(hass, entry.entry_id, entry.data[CONF_CLIMATE], baseline_nodes(hass, entry.options))
     await scheduler.async_load()
     coordinator = OptimizerCoordinator(hass, entry, scheduler)
+    await coordinator.async_load_stores()
     scheduler.fan_config = coordinator.fan_config
     scheduler.fan_blocked = coordinator.fan_blocked
+    scheduler.on_manual_change = coordinator.async_record_change
     entry.runtime_data = RuntimeData(coordinator, scheduler)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -120,11 +133,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
         async_track_time_change(hass, coordinator.async_scheduled_run, hour=hour, minute=minute, second=0)
     )
     entry.async_on_unload(scheduler.async_stop)
+    entry.async_on_unload(scheduler.async_listen())
     entry.async_on_unload(entry.add_update_listener(_async_reload))
 
     async def _started(_: HomeAssistant) -> None:
         await scheduler.async_start()
-        await coordinator.async_refresh()
+        await coordinator.async_plan("startup")
 
     if cancel := async_at_started(hass, _started):
         entry.async_on_unload(cancel)

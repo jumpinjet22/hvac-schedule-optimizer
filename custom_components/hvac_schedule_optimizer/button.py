@@ -17,9 +17,9 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities: AddE
     c: OptimizerCoordinator = entry.runtime_data.coordinator
     async_add_entities(
         [
-            OptimizerButton(c, "optimize_now", "Optimize now", "mdi:magic-staff", c.async_refresh),
+            OptimizerButton(c, "optimize_now", "Optimize now", "mdi:magic-staff", c.async_plan),
             OptimizerButton(c, "apply_proposal", "Apply proposed schedule", "mdi:check-circle", c.async_apply),
-            OptimizerButton(c, "revert", "Revert schedule", "mdi:undo", c.scheduler.async_revert),
+            OptimizerButton(c, "revert", "Revert schedule", "mdi:undo", c.async_revert),
         ]
     )
 

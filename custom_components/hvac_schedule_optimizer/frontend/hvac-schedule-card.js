@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.4.0-beta.2";
+const CARD_VERSION = "0.5.0-beta.1";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -87,6 +87,16 @@ label.tg { display: inline-flex; align-items: center; gap: 9px; font-size: .82re
 .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; }
 input:checked + .sw { background: var(--hso-accent); } input:checked + .sw::after { transform: translateX(14px); }
 input[type=checkbox] { position: absolute; opacity: 0; pointer-events: none; }
+.learn { margin-top: 14px; }
+.learn h4 { margin: 0 0 6px; font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--hso-muted); font-weight: 500; }
+.rule { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 9px; margin: 0 5px 5px 0; border-radius: 8px; font-size: .76rem;
+  background: color-mix(in srgb, var(--hso-warn) 16%, transparent); color: var(--primary-text-color); }
+.rule.pending { background: var(--secondary-background-color, rgba(127,127,127,.08)); color: var(--hso-muted); padding-right: 9px; }
+.rule span { color: var(--hso-muted); font-size: .7rem; }
+.rule button { font: inherit; border: 0; background: transparent; color: var(--hso-muted); cursor: pointer; padding: 0 5px; font-size: .9rem; line-height: 1; }
+.note { font-size: .74rem; color: var(--hso-muted); margin: 2px 0 4px; }
+.linkbtn { font: inherit; font-size: .74rem; border: 0; background: transparent; color: var(--hso-accent); cursor: pointer; padding: 0; }
+.model { margin-top: 10px; font-size: .74rem; color: var(--hso-muted); line-height: 1.5; }
 .empty { padding: 30px 8px; text-align: center; color: var(--hso-muted); font-size: .9rem; }
 .spin { opacity: .55; pointer-events: none; }
 @media (max-width: 480px) { .stat .v { font-size: 1.25rem; } .nodes { grid-template-columns: 1fr; } }
@@ -276,8 +286,10 @@ class HvacScheduleCard extends HTMLElement {
       <div class="chartbox"><div class="chart"></div><div class="tip"></div></div>
       <div class="legend"></div>
       <div class="rt"></div>
+      <div class="model"></div>
       <div class="msgs"></div>
       <div class="nodes"></div>
+      <div class="learn"></div>
       <div class="actions"></div>
       <div class="toggles"></div>`;
 
@@ -285,6 +297,7 @@ class HvacScheduleCard extends HTMLElement {
       this._chart(wrap.querySelector(".chart"), wrap.querySelector(".tip"), r, sch, unit);
       this._legend(wrap.querySelector(".legend"), r);
       this._runtime(wrap.querySelector(".rt"), r);
+      this._model(wrap.querySelector(".model"), r, unit);
     } else {
       wrap.querySelector(".chart").innerHTML = `<div class="empty">${
         r.status === "error" ? "No chart yet." : "Press Optimize to build the first forecast."
@@ -299,12 +312,15 @@ class HvacScheduleCard extends HTMLElement {
     if (r.status === "no_comfortable_schedule")
       lines.push(["bad", "Nothing in the search keeps you inside your comfort limits for today's forecast. Raise a limit or lower the thermostat floor."]);
     if (r.active && r.active.overshoot > 0)
-      lines.push(["warn", `Today's active schedule is predicted to run ${f1(r.active.overshoot)}${unit} over your comfort limit. The proposal stays inside it.`]);
+      lines.push(["warn", `Today's active schedule is predicted to run ${f1(r.active.overshoot)}${unit} over your comfort limit.${r.best ? " The proposal stays inside it." : ""}`]);
     const fan = r.fan;
     if (fan && fan.enabled && fan.blocked) lines.push(["warn", `Fan circulation is paused: ${fan.blocked}.`]);
     else if (fan && fan.enabled && !fan.learned_rooms)
       lines.push(["warn", `Fan control is on, but no room has learned what the fan does yet (${f1(fan.history_fan_only_hours)} of 4 fan-only hours in history). Run the fan on circulate for a few evenings so it can learn.`]);
     if (sch.fan_note) lines.push(["warn", `Fan held at normal: ${sch.fan_note}.`]);
+    const gap = r.indoor_source && r.indoor_source.thermostat_gap;
+    if (gap !== null && gap !== undefined && Math.abs(gap) >= (unit === "\u00b0C" ? 0.6 : 1))
+      lines.push(["warn", `Your indoor sensor reads ${f1(Math.abs(gap))}${unit} ${gap < 0 ? "below" : "above"} the thermostat, and the thermostat controls to its own reading. The learned switching points account for it.`]);
     if (this._notice) lines.push(["bad", this._notice]);
     msgs.innerHTML = lines.map(([t, m]) => `<div class="msg ${t === "bad" ? "bad" : ""}">${this._esc(m)}</div>`).join("");
 
@@ -324,10 +340,13 @@ class HvacScheduleCard extends HTMLElement {
       <button class="b" data-a="revert" ${sch.previous ? "" : "disabled"}>Revert</button>`;
     actions.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => this._act(b.dataset.a)));
 
+    this._learned(wrap.querySelector(".learn"), r, unit);
+
     const toggles = wrap.querySelector(".toggles");
     toggles.innerHTML = `
       <label class="tg"><input type="checkbox" data-t="run" ${sch.enabled ? "checked" : ""}><span class="sw"></span>Run schedule</label>
-      <label class="tg"><input type="checkbox" data-t="auto_apply" ${sch.auto_apply ? "checked" : ""}><span class="sw"></span>Auto apply daily</label>`;
+      <label class="tg"><input type="checkbox" data-t="auto_apply" ${sch.auto_apply ? "checked" : ""}><span class="sw"></span>Auto apply daily</label>
+      <label class="tg"><input type="checkbox" data-t="learn" ${this._state.learn !== false ? "checked" : ""}><span class="sw"></span>Learn from my changes</label>`;
     toggles.querySelectorAll("input").forEach((i) =>
       i.addEventListener("change", () => this._act("toggle", { what: i.dataset.t, value: i.checked }))
     );
@@ -366,18 +385,70 @@ class HvacScheduleCard extends HTMLElement {
     }`;
   }
 
+  _model(node, r, unit) {
+    const bits = [];
+    const c = r.control;
+    if (c && c.source === "learned")
+      bits.push(`Your thermostat keeps cooling until about ${f1(Math.abs(c.used_off_at))}${unit} ${c.used_off_at < 0 ? "below" : "above"} its setpoint and starts again ${f1(Math.abs(c.used_on_at))}${unit} ${c.used_on_at < 0 ? "below" : "above"} it (learned from ${c.stops} cycles)${c.setpoint_shift > 0 ? ", so proposals use setpoint numbers about " + f1(c.setpoint_shift) + unit + " higher for the same comfort" : ""}.`);
+    const res = r.residual;
+    if (res && res.used && res.coef) {
+      const parts = [];
+      if (res.coef.capacity > 0.05) parts.push(`the AC loses some cooling above ${f1(res.t_cap)}${unit} outside`);
+      if (res.coef.soak > 0.05) parts.push("the house holds heat after a sunny afternoon");
+      if (res.coef.hot_sun > 0.05) parts.push("strong sun on hot days adds extra heat");
+      if (parts.length) bits.push(`Learned from the last days: ${parts.join(", ")}.`);
+    }
+    const acc = r.series && r.series.accuracy;
+    if (acc) bits.push(`Earlier forecasts were within ${f1(acc.mae)}${unit} of the real indoor temperature on average over the last 24h${Math.abs(acc.bias) >= 0.3 ? ` (ran ${f1(Math.abs(acc.bias))}${unit} ${acc.bias > 0 ? "warmer" : "cooler"} than predicted)` : ""}.`);
+    node.innerHTML = bits.map((b) => `<div>${this._esc(b)}</div>`).join("");
+  }
+
+  _ruleText(rule, r, unit) {
+    const rooms = (r.series && r.series.rooms) || [];
+    const who = rule.kind === "room" ? ((rooms.find((x) => x.id === rule.room) || {}).name || rule.room) : "House";
+    let when = `${fmtHour(rule.start)} to ${fmtHour(rule.end)}`;
+    if (rule.start === rule.end) when = "all day";
+    let cond = "";
+    if (rule.cond && rule.cond.outdoor_min !== undefined) cond = ` on days over ${f1(rule.cond.outdoor_min)}${unit}`;
+    if (rule.cond && rule.cond.humidity_min !== undefined) cond = ` when humidity is over ${f1(rule.cond.humidity_min)}%`;
+    return `${who} \u2264 ${f1(rule.max)}${unit}, ${when}${cond}`;
+  }
+
+  _learned(node, r, unit) {
+    const cl = r.comfort_learned;
+    if (!cl || (!cl.rules.length && !cl.pending.length && !cl.notes.length)) {
+      node.innerHTML = "";
+      return;
+    }
+    const chips = cl.rules.map((rule) =>
+      `<span class="rule" title="Learned from ${rule.changes} manual changes on ${rule.days} days">${this._esc(this._ruleText(rule, r, unit))} <span>\u00b7 ${rule.days} days</span><button data-forget="${this._esc(rule.id)}" title="Forget this">\u00d7</button></span>`);
+    const pend = cl.pending.map((rule) =>
+      `<span class="rule pending" title="Needs another day like this before it is used">${this._esc(this._ruleText(rule, r, unit))} <span>\u00b7 watching</span></span>`);
+    const notes = cl.notes.map((n) =>
+      `<div class="note">You turned it up around ${fmtHour(n.hour * 60)} on ${n.days} days. It may be cooling more than you need then.</div>`);
+    node.innerHTML = `<h4>Learned comfort</h4>${chips.join("")}${pend.join("")}${notes.join("")}
+      <div><button class="linkbtn" data-reset="1">Forget everything learned</button></div>`;
+    node.querySelectorAll("[data-forget]").forEach((b) =>
+      b.addEventListener("click", () => this._act("comfort", { action: "forget", rule_id: b.dataset.forget })));
+    const reset = node.querySelector("[data-reset]");
+    if (reset) reset.addEventListener("click", () => this._act("comfort", { action: "reset" }));
+  }
+
   _legend(node, r) {
     const hasActive = r.series.indoor && r.series.indoor.active;
+    const acc = (a) => (a ? ` <small style="opacity:.7">\u00b1${f1(a.mae)}\u00b0</small>` : "");
+    const planned = [].concat(r.series.indoor_planned || [], ...(r.series.rooms || []).map((x) => x.planned || [])).some((v) => v !== null && v !== undefined);
     node.innerHTML = [
       `<span><i style="border-color:var(--hso-sun)"></i>Outdoor</span>`,
-      `<span><i style="border-color:var(--primary-text-color)"></i>Indoor</span>`,
+      `<span><i style="border-color:var(--primary-text-color)"></i>Indoor${acc(r.series.accuracy)}</span>`,
+      ...(planned ? [`<span><i class="dash" style="border-color:var(--hso-muted);opacity:.6"></i>Predicted earlier</span>`] : []),
       `<span><i style="border-color:var(--hso-muted)"></i>${hasActive ? "Active" : "Baseline"} setpoint</span>`,
       `<span><i class="dash" style="border-color:var(--hso-accent)"></i>Proposed setpoint</span>`,
       `<span><i class="box" style="background:var(--hso-cool)"></i>AC running</span>`,
       ...(r.series.rooms || []).map((room, k) => {
         const tag = room.trusted ? ROOM_WHEN[room.when] || room.when : "learning";
         const off = this._roomHidden(room);
-        return `<span class="room ${off ? "off" : ""}" data-room="${this._esc(room.id)}" role="button" title="Tap to ${off ? "show" : "hide"}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
+        return `<span class="room ${off ? "off" : ""}" data-room="${this._esc(room.id)}" role="button" title="Tap to ${off ? "show" : "hide"}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)}${acc(room.accuracy)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
       }),
     ].join("");
     node.querySelectorAll(".room").forEach((n) =>
@@ -408,7 +479,7 @@ class HvacScheduleCard extends HTMLElement {
     const baseSp = !activeNodes && r.baseline ? stepSeries(r.baseline.nodes, lm) : null;
     const refSp = activeSp; // the "current" line is the integration's active schedule
     const c = r.comfort;
-    const limit = lm.map((m) => {
+    const limit = s.limit || lm.map((m) => {
       const h = m / 60;
       const inSleep = c.sleep_start > c.sleep_end ? h >= c.sleep_start || h < c.sleep_end : h >= c.sleep_start && h < c.sleep_end;
       const inAwake = c.awake_start < c.awake_end ? h >= c.awake_start && h < c.awake_end : h >= c.awake_start || h < c.awake_end;
@@ -420,7 +491,8 @@ class HvacScheduleCard extends HTMLElement {
     const roomFuture = (room) => room.predicted.proposed || room.predicted.active || room.predicted.baseline || [];
     const ivals = [].concat(
       s.indoor_actual, s.indoor.proposed || [], s.indoor.active || s.indoor.baseline || [], refSp, propSp || [], limit,
-      ...rooms.map((room) => room.actual.concat(roomFuture(room)))
+      s.indoor_planned || [],
+      ...rooms.map((room) => room.actual.concat(roomFuture(room), room.planned || []))
     ).filter((v) => v !== null && v !== undefined);
     let imin = Math.min(...ivals) - 0.8, imax = Math.max(...ivals) + 0.8;
     if (imax - imin < 4) { const mid = (imax + imin) / 2; imin = mid - 2; imax = mid + 2; }
@@ -486,13 +558,21 @@ class HvacScheduleCard extends HTMLElement {
     // rooms: actual (past) solid, predicted (future, under the proposal when there is one) dashed
     rooms.forEach((room) => {
       const col = room.color;
+      if (room.planned) this._line(svg, room.planned, X, Yi, { stroke: col, "stroke-width": 1.2, "stroke-opacity": 0.35, "stroke-dasharray": "3 3" }, false);
       this._line(svg, room.actual, X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": 0.85 }, false);
       this._line(svg, roomFuture(room), X, Yi, { stroke: col, "stroke-width": 1.5, "stroke-opacity": room.trusted ? 0.85 : 0.4, "stroke-dasharray": "4 3" }, false);
     });
 
     // indoor: actual (past) solid, predicted (future) under each schedule
     const ia = s.indoor_actual;
+    if (s.indoor_planned) this._line(svg, s.indoor_planned, X, Yi, { stroke: "var(--primary-text-color, #212121)", "stroke-width": 1.4, "stroke-opacity": 0.4, "stroke-dasharray": "3 3" }, false);
     this._line(svg, ia, X, Yi, { stroke: "var(--primary-text-color, #212121)", "stroke-width": 2.2 }, false);
+
+    // manual setpoint changes (what comfort learning reads)
+    (s.manual || []).forEach((m) => {
+      const x = X(m.i), y = Yi(m.to);
+      el("path", { d: `M${(x - 4).toFixed(1)},${(y - 7).toFixed(1)}L${(x + 4).toFixed(1)},${(y - 7).toFixed(1)}L${x.toFixed(1)},${(y - 1).toFixed(1)}Z`, fill: "var(--hso-warn, #f9a825)", "fill-opacity": 0.9 }, svg);
+    });
     const futureRef = (s.indoor.active || s.indoor.baseline);
     if (futureRef) this._line(svg, futureRef, X, Yi, { stroke: "var(--primary-text-color, #212121)", "stroke-width": 1.4, "stroke-opacity": 0.45, "stroke-dasharray": "2 3" }, false);
     if (s.indoor.proposed) this._line(svg, s.indoor.proposed, X, Yi, { stroke: "var(--hso-accent, #03a9f4)", "stroke-width": 2.2 }, false);
@@ -534,19 +614,26 @@ class HvacScheduleCard extends HTMLElement {
       const i = Math.max(0, Math.min(n - 1, Math.round(((sx - px0) / (px1 - px0)) * (n - 1))));
       cross.setAttribute("x1", X(i)); cross.setAttribute("x2", X(i)); cross.setAttribute("visibility", "visible");
       const future = i >= s.now_index;
+      const withPred = (v, p) => {
+        if (future || p === null || p === undefined || v === null || v === undefined) return `${f1(v)}${unit}`;
+        const d = v - p;
+        return `${f1(v)}${unit} <span style="opacity:.65">pred ${f1(p)} (${d >= 0 ? "+" : ""}${f1(d)})</span>`;
+      };
       const rows = [
         ["Outdoor", `${f1(s.outdoor[i])}${unit}`],
-        [future ? "Indoor (active)" : "Indoor", `${f1(future ? (s.indoor.active || s.indoor.baseline || [])[i] : ia[i])}${unit}`],
+        [future ? "Indoor (active)" : "Indoor", future ? `${f1((s.indoor.active || s.indoor.baseline || [])[i])}${unit}` : withPred(ia[i], (s.indoor_planned || [])[i])],
       ];
       if (future && s.indoor.proposed) rows.push(["Indoor (proposed)", `${f1(s.indoor.proposed[i])}${unit}`]);
       rooms.forEach((room) => {
         const v = future ? roomFuture(room)[i] : room.actual[i];
-        if (v !== null && v !== undefined) rows.push([room.name, `${f1(v)}${unit}`]);
+        if (v !== null && v !== undefined) rows.push([room.name, withPred(v, (room.planned || [])[i])]);
       });
       rows.push(["Setpoint", `${f1(refSp[i])}${unit}`]);
       if (propSp) rows.push(["Proposed", `${f1(propSp[i])}${unit}`]);
       const ac = future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i];
       rows.push(["AC", ac === null || ac === undefined ? "-" : ac >= 0.5 ? "on" : "off"]);
+      const man = (s.manual || []).find((m) => m.i === i);
+      if (man) rows.push(["You changed", `${f1(man.from)} \u2192 ${f1(man.to)}${unit}`]);
       if (fanRow) {
         const fv = future ? (s.fan.proposed || s.fan.active || [])[i] : (s.fan_actual || [])[i];
         rows.push([future ? "Fan (proposed)" : "Fan", fv === null || fv === undefined ? "-" : fv >= 0.5 ? "circulate" : "normal"]);

@@ -10,3 +10,10 @@ set_schedule:
       selector:
         entity:
           domain: climate
+reset_learned_comfort:
+  fields:
+    climate_entity:
+      required: false
+      selector:
+        entity:
+          domain: climate

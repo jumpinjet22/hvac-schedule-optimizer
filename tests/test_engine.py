@@ -30,7 +30,9 @@ def _weather(ts):
     return temp, sun
 
 
-def _synthetic(history_days=14, noise=0.05, seed=7):
+def _synthetic(history_days=14, noise=0.05, seed=7, band=None, hot=0.0, weak_above=None, weak=0.0):
+    """band: the true thermostat switching band; hot: extra outdoor degrees;
+    weak_above/weak: the AC loses `weak` of its cooling above that outdoor temperature."""
     rng = random.Random(seed)
     s = engine.Settings.defaults(True)
     n_hist = history_days * 96
@@ -38,7 +40,12 @@ def _synthetic(history_days=14, noise=0.05, seed=7):
     t0 = 1_792_000_000 - (1_792_000_000 % STEP)
     g0 = t0 - n_hist * STEP
     ts = [g0 + i * STEP for i in range(n_hist + n_hor)]
-    wx = [_weather(t) for t in ts]
+
+    def wxf(t):
+        temp, sun = _weather(t)
+        return temp + hot, sun
+
+    wx = [wxf(t) for t in ts]
     truth = {"k": 0.09, "g": 1.1, "q": 0.15, "c": 3.2}
 
     mins = [m for m, _ in s.baseline]
@@ -46,8 +53,12 @@ def _synthetic(history_days=14, noise=0.05, seed=7):
     from bisect import bisect_right
 
     sp_hist = [temps[bisect_right(mins, _local_min(t)) - 1] for t in ts[:n_hist]]
+    corr = None
+    if weak_above is not None:
+        corr = ([0.0] * n_hist, [truth["c"] * weak if w[0] > weak_above else 0.0 for w in wx[:n_hist]])
     Ti_true, on_true = engine.simulate(
-        truth, [w[0] for w in wx[:n_hist]], [w[1] for w in wx[:n_hist]], 73.0, sp_hist, s.hysteresis
+        truth, [w[0] for w in wx[:n_hist]], [w[1] for w in wx[:n_hist]], 73.0, sp_hist,
+        band if band is not None else s.hysteresis, 0, corr,
     )
     indoor = [(ts[i], Ti_true[i] + rng.gauss(0, noise)) for i in range(n_hist)]
     on = [(ts[i], float(on_true[i])) for i in range(n_hist)]
@@ -65,8 +76,8 @@ def _synthetic(history_days=14, noise=0.05, seed=7):
         on=on,
         setpoint=setp,
         weather_ts=wts,
-        weather_temp=[_weather(t)[0] for t in wts],
-        weather_sun=[_weather(t)[1] for t in wts],
+        weather_temp=[wxf(t)[0] for t in wts],
+        weather_sun=[wxf(t)[1] for t in wts],
         local_minutes=[_local_min(t) for t in ts[n_hist:]],
         settings=s,
     )
@@ -373,3 +384,231 @@ def test_fan_skipped_when_blower_costs_more_than_it_saves():
     assert res["best"]["energy_index"] <= no_fan["best"]["energy_index"] + 1e-9
     if not any(n.get("fan") for n in res["best"]["nodes"]):
         assert res["best"]["nodes"] == no_fan["best"]["nodes"]
+
+
+# ------------------------------------------------------------------ thermostat switching band
+def test_learns_thermostat_that_cools_below_setpoint():
+    # The thermostat keeps cooling until the reading is 2.5 below the setpoint (remote sensors, say).
+    inp, truth = _synthetic(band=(-2.5, -1.5))
+    plain = engine.validate(
+        engine.fit_model(*_fit_args(inp)), *_val_args(inp)
+    )
+    r = engine.run(inp)
+    c = r["control"]
+    assert c["source"] == "learned"
+    assert -3.2 < c["off_at"] < -2.2 and -2.2 < c["on_at"] < -1.0
+    assert plain["ratio"] < 0.9  # the old symmetric band under-predicts runtime
+    assert 0.85 < r["validation"]["ratio"] < 1.15
+    assert r["control"]["setpoint_shift"] >= 1.0  # proposes higher numbers for the same comfort
+
+
+def _hist(inp):
+    Ti = engine.resample(inp.indoor, inp.g0, inp.n_hist, inp.data_end)
+    on = engine.resample(inp.on, inp.g0, inp.n_hist, inp.data_end)
+    sp = engine.ffill(engine.resample(inp.setpoint, inp.g0, inp.n_hist, inp.data_end))
+    ts = [inp.g0 + i * STEP for i in range(inp.n_hist)]
+    To = [engine.interp(t, inp.weather_ts, inp.weather_temp) for t in ts]
+    S = [engine.interp(t, inp.weather_ts, inp.weather_sun) for t in ts]
+    return Ti, on, sp, To, S
+
+
+def _fit_args(inp):
+    Ti, on, sp, To, S = _hist(inp)
+    return Ti, To, S, on, inp.settings
+
+
+def _val_args(inp):
+    Ti, on, sp, To, S = _hist(inp)
+    return Ti, on, sp, To, S, inp.n_hist, inp.settings
+
+
+def test_too_few_switches_keeps_default_band():
+    s = engine.Settings.defaults(True)
+    c = engine.learn_control([(0, 74.0), (900, 75.0)], [(0, 0.0), (450, 1.0)], [(0, 74.0)], s)
+    assert c["source"] == "default"
+
+
+def test_start_right_after_setpoint_drop_is_ignored():
+    s = engine.Settings.defaults(True)
+    s.min_control_events = 1
+    indoor = [(i * 60, 75.0) for i in range(400)]
+    sp = [(0, 75.0), (10000, 72.0)]
+    # normal cycle at +0.5 / -0.5, then a forced start the moment the setpoint drops (reading 3 above)
+    on = [(0, 0.0), (2000, 1.0), (4000, 0.0), (10010, 1.0), (16000, 0.0)]
+    pts = [(t, 75.0 + (0.5 if t == 2000 else 0.0)) for t, _ in indoor]
+    c = engine.learn_control(pts, on, sp, s)
+    assert c["starts"] == 1  # the 10010 start is skipped
+
+
+# ------------------------------------------------------------------ residual layer
+def test_learns_ac_losing_capacity_on_hot_days():
+    inp, truth = _synthetic(hot=6.0, weak_above=90.0, weak=0.35, noise=0.03)
+    r = engine.run(inp)
+    res = r["residual"]
+    assert res["used"], res
+    assert res["coef"]["capacity"] > 0
+    assert res["rmse_with"] < res["rmse_without"]
+
+
+def test_residual_rejected_when_model_is_already_right():
+    inp, _ = _synthetic()
+    r = engine.run(inp)
+    assert not r["residual"]["used"]
+
+
+# ------------------------------------------------------------------ per-bin limits and learned comfort
+def test_learned_rule_tightens_only_its_window():
+    s = engine.Settings.defaults(True)
+    lm = [h * 60 for h in range(24)]
+    rule = {"kind": "house", "start": 21 * 60, "end": 22 * 60, "max": 74.0, "cond": None}
+    ctx = engine.make_ctx([80.0] * 24, [0.0] * 24, lm, s, learned=[rule])
+    assert ctx["lim"][1 + 21] == 74.0
+    assert ctx["lim"][1 + 20] == s.awake_max
+    hot = {"kind": "house", "start": 0, "end": 0, "max": 74.0, "cond": {"outdoor_min": 90.0}}
+    ctx = engine.make_ctx([80.0] * 12 + [95.0] * 12, [0.0] * 24, lm, s, learned=[hot])
+    assert ctx["lim"][1 + 10] == s.awake_max and ctx["lim"][1 + 14] == 74.0
+
+
+def _ev(day, hour, frm=74.0, to=72.0, indoor=74.5, rooms=None, outdoor=85.0, humidity=45.0):
+    ts = 1_792_000_000 - 30 * 86400 + day * 86400 + hour * 3600
+    return {"ts": ts, "lm": hour * 60, "from": frm, "to": to, "indoor": indoor, "rooms": rooms or {},
+            "outdoor": outdoor, "humidity": humidity, "source": "ui"}
+
+
+def test_comfort_rule_needs_two_days():
+    s = engine.Settings.defaults(True)
+    now = 1_792_000_000 - 30 * 86400 + 20 * 86400
+    room = {"sensor.bed": {"t": 76.5, "trend": 0.2}}
+    one = engine.learn_comfort([_ev(18, 21, rooms=room)], now, s, None, {"sensor.bed"})
+    assert not one["rules"] and one["pending"]
+    two = engine.learn_comfort([_ev(16, 21, rooms=room), _ev(18, 21, rooms=room)], now, s, None, {"sensor.bed"})
+    rule = two["rules"][0]
+    assert rule["kind"] == "room" and rule["room"] == "sensor.bed"
+    assert rule["max"] == 75.5 and rule["start"] == 20 * 60
+    assert rule["max"] <= s.awake_max
+
+
+def test_comfort_causes_hot_humid_and_never_loosens():
+    s = engine.Settings.defaults(True)
+    now = 1_792_000_000 - 30 * 86400 + 20 * 86400
+    hot = engine.learn_comfort([_ev(15, 17, outdoor=96), _ev(17, 17, outdoor=97)], now, s, 92.0, set())
+    assert hot["rules"][0]["cause"] == "hot" and hot["rules"][0]["cond"]["outdoor_min"] == 94.0
+    humid = engine.learn_comfort([_ev(15, 17, humidity=66), _ev(17, 17, humidity=64)], now, s, 92.0, set())
+    assert humid["rules"][0]["cause"] == "humid"
+    # turned down while already well inside the limit: nothing to tighten
+    cool = engine.learn_comfort([_ev(15, 17, indoor=70.0), _ev(17, 17, indoor=70.0)], now, s, None, set())
+    assert all(r["max"] >= s.awake_max - s.learn_max_drop for r in cool["rules"])
+    # never more than learn_max_drop below the configured limit
+    cold = engine.learn_comfort([_ev(15, 17, indoor=60.0), _ev(17, 17, indoor=60.0)], now, s, None, set())
+    assert cold["rules"][0]["max"] == s.awake_max - s.learn_max_drop
+
+
+def test_comfort_rules_fade_and_turn_ups_count_against():
+    s = engine.Settings.defaults(True)
+    base = 1_792_000_000 - 30 * 86400
+    evs = [_ev(0, 21), _ev(2, 21)]
+    assert engine.learn_comfort(evs, base + 4 * 86400, s, None, set())["rules"]
+    assert not engine.learn_comfort(evs, base + 27 * 86400, s, None, set())["rules"]  # faded
+    ups = evs + [_ev(3, 20, frm=72, to=74), _ev(4, 20, frm=72, to=74)]
+    out = engine.learn_comfort(ups, base + 5 * 86400, s, None, set())
+    assert not out["rules"] and out["notes"]
+    forgot = engine.learn_comfort(evs, base + 4 * 86400, s, None, set(), {"time::awake": base + 3 * 86400})
+    assert not forgot["rules"] and not forgot["pending"]
+
+
+def test_learned_rule_changes_the_proposal():
+    inp, _ = _synthetic()
+    plain = engine.run(inp)
+    now = inp.data_end
+    evs = [
+        {"ts": now - d * 86400, "lm": 15 * 60, "from": 76, "to": 73, "indoor": 74.0, "rooms": {},
+         "outdoor": 80, "humidity": 40, "source": "ui"}
+        for d in (3, 1)
+    ]
+    inp.comfort_events = evs
+    r = engine.run(inp)
+    rules = r["comfort_learned"]["rules"]
+    assert rules and rules[0]["max"] == 73.0
+    assert r["best"]["temp_max"] <= plain["best"]["temp_max"]
+    assert r["series"]["limit"][r["series"]["now_index"]:].count(73.0) > 0
+
+
+# ------------------------------------------------------------------ free-form search
+def test_refine_respects_change_limits_and_is_deterministic():
+    inp, _ = _synthetic()
+    a = engine.run(inp)
+    b = engine.run(inp)
+    assert a["best"] == b["best"]
+    nodes = a["best"]["nodes"]
+    mins = sorted(engine.to_minutes(n["time"]) for n in nodes)
+    assert len(nodes) <= inp.settings.max_nodes
+    if len(mins) > 1:
+        gaps = [y - x for x, y in zip(mins, mins[1:])] + [1440 - mins[-1] + mins[0]]
+        assert min(gaps) >= inp.settings.min_gap
+    assert a["search"]["refine_evals"] <= inp.settings.max_evals
+
+
+def test_refine_finds_precool_when_ac_is_weak_in_the_afternoon():
+    s = engine.Settings.defaults(True)
+    lm = [(i * 15) % 1440 for i in range(96)]
+    To = [80 + 18 * max(0.0, math.sin(math.pi * (m / 60 - 9) / 12)) for m in lm]
+    S = [max(0.0, 900 * math.sin(math.pi * (m / 60 - 6) / 12)) for m in lm]
+    m = {"k": 0.09, "g": 1.1, "q": 0.15, "c": 2.0}  # an AC that cannot keep up at the peak
+    ctx = engine.make_ctx(To, S, lm, s)
+    grid_best = None
+    for nodes in engine.candidates(s):
+        r = engine.evaluate(m, nodes, ctx, 71.0, 0, s)
+        if engine._better(r, grid_best, s):
+            grid_best = r
+    assert grid_best["viol"] > 0  # no day/night shape holds the afternoon
+    best, evals = engine.refine(m, [(grid_best["nodes"], None)], ctx, 71.0, 0, s, 66.0, 77.0)
+    assert best["viol"] == 0.0
+    noon = lambda nodes: engine.setpoint_at([{"time": engine.hhmm(mn), "temp": t} for mn, t in nodes], 12 * 60)
+    assert noon(best["nodes"]) < noon(grid_best["nodes"])  # cools ahead of the hot hours
+    assert evals <= s.max_evals
+
+
+def test_previous_proposal_is_kept_when_close():
+    inp, _ = _synthetic()
+    first = engine.run(inp)
+    inp.previous_nodes = first["best"]["nodes"]
+    again = engine.run(inp)
+    assert again["best"]["nodes"] == first["best"]["nodes"]
+    # a previous proposal that now breaks comfort is dropped
+    inp.previous_nodes = [{"time": "00:00", "temp": 80}]
+    r = engine.run(inp)
+    assert not r["search"]["kept_previous"] and r["best"]["nodes"] != inp.previous_nodes
+
+
+# ------------------------------------------------------------------ stored forecasts
+def test_past_plan_series_and_accuracy():
+    inp, _ = _synthetic()
+    r0 = engine.run(inp)
+    s0 = r0["series"]
+    start = s0["start"]
+    plan = {start + i * STEP: {"in": v + 0.5, "rooms": {}} for i, v in enumerate(s0["indoor_actual"][: s0["now_index"]]) if v is not None}
+    inp.past_plan = plan
+    r = engine.run(inp)
+    s = r["series"]
+    assert s["indoor_planned"][: s["now_index"]].count(None) < 5
+    assert all(v is None for v in s["indoor_planned"][s["now_index"]:])
+    assert abs(s["accuracy"]["bias"] + 0.5) < 0.06 and abs(s["accuracy"]["mae"] - 0.5) < 0.06
+    bins = r["plan_bins"]
+    assert len(bins) == inp.n_hor and bins[0]["ts"] == start + s["now_index"] * STEP
+    assert {"in", "sp", "ac", "to", "sun", "rooms"} <= set(bins[0])
+
+
+def test_accuracy_needs_enough_pairs():
+    assert engine.accuracy([70.0] * 10, [71.0] * 10) is None
+    acc = engine.accuracy([70.0] * 30, [71.0] * 30)
+    assert acc == {"mae": 1.0, "bias": -1.0, "n": 30}
+
+
+def test_quick_refresh_grid_is_smaller_and_still_comfortable():
+    inp, _ = _synthetic()
+    full = engine.run(inp)
+    inp.quick = True
+    quick = engine.run(inp)
+    assert quick["candidates"] < full["candidates"] / 5
+    assert quick["best"] is not None and quick["best"]["overshoot"] == 0
+    assert quick["best"]["energy_index"] <= full["best"]["energy_index"] * 1.03

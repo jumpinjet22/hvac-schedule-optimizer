@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, Context, Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.helpers.event import async_track_point_in_time, async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -30,6 +31,10 @@ class Scheduler:
     thermostat to the circulate mode until the next node. The fan is only
     touched while the schedule uses it (or this scheduler switched it), and it
     goes back to the normal mode on pause and unload.
+
+    Manual changes: every write here carries a context of its own, so a setpoint
+    change with any other context (the app, the wall, the vendor's app) is reported
+    to on_manual_change for comfort learning.
     """
 
     def __init__(self, hass: HomeAssistant, entry_id: str, climate_entity: str, default_nodes: list[dict]) -> None:
@@ -51,6 +56,8 @@ class Scheduler:
         self.fan_blocked: Callable[[], str | None] = lambda: None
         self.fan_forced = False
         self.fan_note: str | None = None
+        self.on_manual_change: Callable[[float, float, str], Awaitable[None]] | None = None
+        self._own_ctx: deque[str] = deque(maxlen=20)
 
     # ---------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -102,6 +109,35 @@ class Scheduler:
         if self.enabled:
             await self._async_apply_current()
             self._arm()
+
+    @callback
+    def async_listen(self) -> CALLBACK_TYPE:
+        """Watch the thermostat for setpoint changes this scheduler did not make."""
+        return async_track_state_change_event(self.hass, [self.climate_entity], self._async_state_changed)
+
+    def _context(self) -> Context:
+        ctx = Context()
+        self._own_ctx.append(ctx.id)
+        return ctx
+
+    async def _async_state_changed(self, event: Event[EventStateChangedData]) -> None:
+        old, new = event.data["old_state"], event.data["new_state"]
+        if old is None or new is None or new.state != "cool" or not self.enabled or self.on_manual_change is None:
+            return
+        try:
+            before, after = float(old.attributes["temperature"]), float(new.attributes["temperature"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if abs(before - after) < 1e-6:
+            return
+        ctx = new.context
+        if ctx.id in self._own_ctx or (ctx.parent_id and ctx.parent_id in self._own_ctx):
+            return
+        if self.last_set and abs(float(self.last_set["temp"]) - after) < 1e-6:
+            set_at = dt_util.parse_datetime(self.last_set["at"])
+            if set_at and (dt_util.utcnow() - set_at).total_seconds() < 120:
+                return  # a cloud thermostat echoing our own write back
+        await self.on_manual_change(before, after, "ui" if ctx.user_id else "device")
 
     @callback
     def async_stop(self) -> None:
@@ -226,6 +262,7 @@ class Scheduler:
                 "set_temperature",
                 {"entity_id": self.climate_entity, "temperature": temp},
                 blocking=True,
+                context=self._context(),
             )
         except HomeAssistantError as err:
             _LOGGER.warning("Could not set %s to %s: %s", self.climate_entity, temp, err)
@@ -252,7 +289,11 @@ class Scheduler:
         if state.attributes.get("fan_mode") != mode:
             try:
                 await self.hass.services.async_call(
-                    "climate", "set_fan_mode", {"entity_id": self.climate_entity, "fan_mode": mode}, blocking=True
+                    "climate",
+                    "set_fan_mode",
+                    {"entity_id": self.climate_entity, "fan_mode": mode},
+                    blocking=True,
+                    context=self._context(),
                 )
             except HomeAssistantError as err:
                 _LOGGER.warning("Could not set %s fan to %s: %s", self.climate_entity, mode, err)

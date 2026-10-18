@@ -1,4 +1,4 @@
-"""Switches: run the schedule, and let the optimizer replace it automatically."""
+"""Switches: run the schedule, let the optimizer replace it automatically, learn from manual changes."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .coordinator import OptimizerCoordinator
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator: OptimizerCoordinator = entry.runtime_data.coordinator
-    async_add_entities([SchedulerSwitch(coordinator), AutoApplySwitch(coordinator)])
+    async_add_entities([SchedulerSwitch(coordinator), AutoApplySwitch(coordinator), LearnSwitch(coordinator)])
 
 
 class _Base(SwitchEntity):
@@ -71,3 +71,23 @@ class AutoApplySwitch(_Base):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._scheduler.async_set_auto_apply(False)
+
+
+class LearnSwitch(_Base):
+    """When on, manual setpoint changes are kept and repeated turn-downs tighten the comfort limits."""
+
+    def __init__(self, coordinator: OptimizerCoordinator) -> None:
+        super().__init__(coordinator, "learn_comfort", "Learn from my changes", "mdi:school")
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._coordinator.async_add_listener(self.async_write_ha_state))
+
+    @property
+    def is_on(self) -> bool:
+        return self._coordinator.learn_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_learn(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_learn(False)
