@@ -65,6 +65,8 @@ Heating works the same way, for any common setup:
   12 hours after anyone picks a mode by hand, and never switches a thermostat that is off.
   If Home Assistant is down the thermostat stays in its last mode, so leave this off if that
   would be a problem in your climate.
+- If the house starts outside a limit (after a long setback, or when you change a limit), the plan
+  is held to getting back as fast as the equipment can, then to the limits again.
 - Comfort learning works for heat too: turning the heat **up** on 2 days for the same reason (a
   cold room, a cold day, or that time of day) raises that minimum, with the same limits and
   fading as on the cooling side.
@@ -186,7 +188,7 @@ what the house and each room were predicted to do by the planning run that day, 
 really happened, and the legend shows each one's average miss (for example `±0.4°`). Small
 markers show your manual setpoint changes. Hover or touch the chart for exact values,
 including how far each reading was from its prediction.
-Under the chart is a runtime panel: AC hours over the last 24h, predicted hours for the next 24h under your active and proposed schedules, and minutes of runtime per hour for each. Below that are the active and proposed schedule times, **Apply proposed**, **Optimize now**,
+Under the chart, the AC and heat strips show what really ran before now (filled) with what the plan expected on the row below (outlined, **pred**), so you can see at a glance whether the system behaves as predicted. The runtime panel shows the last 24 hours as actual against predicted hours with the difference in percent, predicted hours for the next 24h under your active and proposed schedules, and minutes of runtime per hour for each. Below that are the active and proposed schedule times, **Apply proposed**, **Optimize now**,
 **Revert**, and the Run and Auto apply switches. Buttons and switches need an admin user.
 
 If the card does not show up after installing, restart Home Assistant and hard refresh the browser.

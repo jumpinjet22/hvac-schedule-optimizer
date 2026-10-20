@@ -598,6 +598,25 @@ def test_past_plan_series_and_accuracy():
     assert {"in", "sp", "ac", "to", "sun", "rooms"} <= set(bins[0])
 
 
+def test_past_runtime_actual_vs_planned():
+    inp, _ = _synthetic()
+    r0 = engine.run(inp)
+    s0 = r0["series"]
+    past = s0["now_index"]
+    assert r0["runtime"]["past"] is None and s0["ac_planned"].count(None) == len(s0["ac_planned"])
+    # an earlier run that expected half the runtime that really happened, for every past bin
+    inp.past_plan = {
+        s0["start"] + i * STEP: {"in": s0["indoor_actual"][i], "ac": v / 2, "heat": 0, "rooms": {}}
+        for i, v in enumerate(s0["ac_actual"][:past])
+        if v is not None
+    }
+    r = engine.run(inp)
+    s, p = r["series"], r["runtime"]["past"]
+    assert s["ac_planned"][:past].count(None) < 5 and all(v is None for v in s["ac_planned"][past:])
+    assert p["actual"] > 0 and abs(p["planned"] - p["actual"] / 2) < 0.01
+    assert p["hours_covered"] > 22
+
+
 def test_accuracy_needs_enough_pairs():
     assert engine.accuracy([70.0] * 10, [71.0] * 10) is None
     acc = engine.accuracy([70.0] * 30, [71.0] * 30)
@@ -773,3 +792,32 @@ def test_comfort_heat_side_learns_from_turn_ups():
     # a learned minimum raises the heating limit only inside its window
     ctx = engine.make_ctx([40.0] * 24, [0.0] * 24, [h * 60 for h in range(24)], s, learned=[{**rule, "kind": "house", "start": 6 * 60, "end": 9 * 60, "max": 70.0}])
     assert ctx["lim_min"][1 + 7] == 70.0 and ctx["lim_min"][1 + 12] == s.awake_min
+
+
+# ------------------------------------------------------------------ starting outside a limit
+def _start_at(inp, temp, bins=3):
+    """The last few indoor readings at temp, as after a long setback or a changed limit."""
+    inp.indoor[-bins:] = [(ts, temp) for ts, _ in inp.indoor[-bins:]]
+
+
+def test_cold_start_recovers_instead_of_failing_every_schedule():
+    inp, _ = _winter()
+    _start_at(inp, min(inp.settings.awake_min, inp.settings.sleep_min) - 6)
+    r = engine.run(inp)
+    assert r["status"] != "no_comfortable_schedule" and r["best"] is not None
+    assert r["comfort"]["recovering_min"] > 30
+    # it heats from the start, and the limit applies again once the house is back
+    assert r["series"]["heat"]["proposed"][r["series"]["now_index"]] > 0.5
+
+
+def test_hot_start_recovers_instead_of_failing_every_schedule():
+    inp, _ = _synthetic()
+    _start_at(inp, inp.settings.awake_max + 5)
+    r = engine.run(inp)
+    assert r["best"] is not None and r["comfort"]["recovering_min"] > 30
+    assert r["series"]["ac"]["proposed"][r["series"]["now_index"]] > 0.5
+
+
+def test_inside_the_limits_nothing_is_eased():
+    inp, _ = _synthetic()
+    assert engine.run(inp)["comfort"]["recovering_min"] == 0

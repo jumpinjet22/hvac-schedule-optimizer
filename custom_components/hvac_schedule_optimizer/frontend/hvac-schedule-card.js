@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.6.0-beta.1";
+const CARD_VERSION = "0.6.0-beta.2";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -67,6 +67,7 @@ svg text { font-family: var(--paper-font-body1_-_font-family, inherit); fill: va
 .rtgrid b { display: block; font-size: 1.1rem; font-weight: 500; color: var(--primary-text-color); }
 .rtgrid b small { font-size: .72rem; font-weight: 400; color: var(--hso-muted); }
 .rtgrid b.acc { color: var(--hso-accent); }
+.rtgrid b small.good { color: var(--hso-good); } .rtgrid b small.warn { color: var(--hso-warn); } .rtgrid b small.bad { color: var(--hso-bad); }
 .bars { display: flex; align-items: flex-end; gap: 2px; height: 54px; }
 .bars .h { flex: 1; display: flex; align-items: flex-end; gap: 1px; height: 100%; }
 .bars .h i { flex: 1; border-radius: 2px 2px 0 0; min-height: 0; background: var(--hso-muted); opacity: .55; }
@@ -325,6 +326,8 @@ class HvacScheduleCard extends HTMLElement {
       lines.push(["warn", `Fan control is on, but no room has learned what the fan does yet (${f1(fan.history_fan_only_hours)} of 4 fan-only hours in history). Run the fan on circulate for a few evenings so it can learn.`]);
     if (sch.fan_note) lines.push(["warn", `Fan held at normal: ${sch.fan_note}.`]);
     if (sch.mode_note) lines.push(["warn", `${sch.mode_note}.`]);
+    if (r.comfort && r.comfort.recovering_min > 0)
+      lines.push(["warn", `The house is outside its comfort limits right now. The plan gets it back as fast as the equipment can (about ${Math.round(r.comfort.recovering_min + 30)} min), then holds the limits again.`]);
     if (r.comfort && r.comfort.heats && !r.heat_learned && r.status !== "error")
       lines.push(["warn", "Heating has not run enough in the recent history to learn it yet. It learns as the heat runs (about 8 hours)."]);
     const gap = r.indoor_source && r.indoor_source.thermostat_gap;
@@ -371,8 +374,18 @@ class HvacScheduleCard extends HTMLElement {
     const prop = rt.proposed;
     const hrs = (v) => (v === null || v === undefined ? "-" : `${f1(v)}<small>h</small>`);
     const stat = (label, v, cls) => `<div>${label}<b class="${cls || ""}">${v}</b></div>`;
+    // Was the plan right? Actual against what the planning runs expected, over the same hours.
+    const vs = (p) => {
+      if (!p) return null;
+      const d = p.planned > 0.05 ? Math.round(((p.actual - p.planned) / p.planned) * 100) : null;
+      const cls = d === null ? "" : Math.abs(d) <= 20 ? "good" : Math.abs(d) <= 40 ? "warn" : "bad";
+      return `${hrs(p.actual)} <small>vs ${f1(p.planned)}h pred</small>${d === null ? "" : ` <small class="${cls}">${d > 0 ? "+" : ""}${d}%</small>`}`;
+    };
+    const past = vs(rt.past);
     const cells = [
-      stat("Last 24h actual", hrs(rt.actual_24h_hours)),
+      past
+        ? stat(rt.past.hours_covered < 23.5 ? `Last ${Math.round(rt.past.hours_covered)}h, actual vs predicted` : "Last 24h, actual vs predicted", past)
+        : stat("Last 24h actual", hrs(rt.actual_24h_hours)),
       stat(rt.active ? "Next 24h, active" : "Next 24h, baseline", hrs(cur && cur.hours)),
       stat("Next 24h, proposed", hrs(prop && prop.hours), "acc"),
     ];
@@ -390,12 +403,13 @@ class HvacScheduleCard extends HTMLElement {
           .join("")
       : "";
     const what = rt.kind === "heat" ? "heating" : "AC";
+    if (rt.past_heat) cells.push(stat("Heating, actual vs predicted", vs(rt.past_heat)));
     if (rt.kind !== "heat" && cur && cur.heat_hours !== undefined)
       cells.push(stat("Heating, next 24h", `${hrs(cur.heat_hours)}${prop && prop.heat_hours !== undefined ? ` \u2192 ${hrs(prop.heat_hours)}` : ""}`));
-    node.innerHTML = `<h4>Predicted ${what} runtime</h4><div class="rtgrid">${cells.join("")}</div>${
+    node.innerHTML = `<h4>${what === "AC" ? "AC" : "Heating"} runtime</h4><div class="rtgrid">${cells.join("")}</div>${
       hasBars
         ? `<div class="bars">${bars}</div><div class="barlab"><span>${fmtHour(start * 60)}</span><span>${fmtHour(((start + 6) % 24) * 60)}</span><span>${fmtHour(((start + 12) % 24) * 60)}</span><span>${fmtHour(((start + 18) % 24) * 60)}</span><span>${fmtHour(((start + 24) % 24) * 60)}</span></div>
-           <div class="sub" style="margin-top:6px">Minutes per hour, grey is ${rt.active ? "active" : "baseline"}, blue is proposed. ${prop ? "Proposed: " + extra(prop) + "." : ""}</div>`
+           <div class="sub" style="margin-top:6px">${rt.past || rt.past_heat ? "On the chart, before now: filled is what ran, outlined (pred) is what the plan expected. " : ""}Minutes per hour, grey is ${rt.active ? "active" : "baseline"}, blue is proposed. ${prop ? "Proposed: " + extra(prop) + "." : ""}</div>`
         : ""
     }`;
   }
@@ -619,24 +633,37 @@ class HvacScheduleCard extends HTMLElement {
 
     // equipment strips: AC (now / proposed), heat (now / proposed), fan
     const bw = (px1 - px0) / (n - 1);
-    const lab = (txt, y) => { const t = el("text", { x: px0 - 6, y: y + 7.5, "text-anchor": "end" }, svg); t.textContent = txt; };
+    const lab = (txt, y, right) => {
+      const t = el("text", right ? { x: px1 + 4, y: y + 7.5, "text-anchor": "start" } : { x: px0 - 6, y: y + 7.5, "text-anchor": "end" }, svg);
+      t.textContent = txt;
+    };
     let ry = py1 + 10;
-    const strip = (label, past, fut, color, solid) => {
+    // past: what ran (filled) or, with predicted, what the plan expected (outlined); future: the forecast
+    const strip = (label, past, fut, color, solid, predicted, rightLabel) => {
       for (let i = 0; i < n; i++) {
-        const v = i < s.now_index ? (past ? past[i] : null) : fut[i];
-        if (v) el("rect", { x: X(i) - bw / 2, y: ry, width: bw + 0.4, height: acH, rx: 1.5, fill: color, "fill-opacity": i < s.now_index || !solid ? 0.25 + 0.7 * Math.min(1, v) : 0.85 }, svg);
+        const isPast = i < s.now_index;
+        const v = isPast ? (past ? past[i] : null) : fut[i];
+        if (!v) continue;
+        if (isPast && predicted) {
+          const h = Math.max(2, acH * Math.min(1, v));
+          el("rect", { x: X(i) - bw / 2 + 0.4, y: ry + acH - h + 0.4, width: Math.max(0.5, bw - 0.4), height: h - 0.8, fill: color, "fill-opacity": 0.12, stroke: color, "stroke-width": 0.8, "stroke-opacity": 0.9 }, svg);
+        } else el("rect", { x: X(i) - bw / 2, y: ry, width: bw + 0.4, height: acH, rx: 1.5, fill: color, "fill-opacity": isPast || !solid ? 0.25 + 0.7 * Math.min(1, v) : 0.85 }, svg);
       }
       lab(label, ry);
+      if (rightLabel) lab(rightLabel, ry, true);
       ry += acH + acGap;
     };
+    const anyPlan = (a) => (a || []).some((v) => v !== null && v !== undefined);
     if (cools) {
+      const pred = anyPlan(s.ac_planned);
       strip("AC", s.ac_actual, s.ac.active || s.ac.baseline || [], "#4aa3ff", false);
-      strip("new", null, s.ac.proposed || [], "var(--hso-accent, #03a9f4)", true);
+      strip(pred ? "pred" : "new", pred ? s.ac_planned : null, s.ac.proposed || [], "var(--hso-accent, #03a9f4)", true, true, pred && s.ac.proposed ? "new" : null);
     }
     if (heatRow) {
       const hf = (s.heat && (s.heat.active || s.heat.baseline)) || [];
+      const pred = anyPlan(s.heat_planned);
       strip("heat", s.heat_actual || [], hf, "#ff7043", false);
-      strip("new", null, (s.heat && s.heat.proposed) || [], "#ff7043", true);
+      strip(pred ? "pred" : "new", pred ? s.heat_planned : null, (s.heat && s.heat.proposed) || [], "#ff7043", true, true, pred && s.heat && s.heat.proposed ? "new" : null);
     }
     if (fanRow) strip("fan", s.fan_actual || [], s.fan.proposed || s.fan.active || s.fan.baseline || [], "#26a69a", true);
 
@@ -673,8 +700,9 @@ class HvacScheduleCard extends HTMLElement {
       if (heatRef) rows.push(["Heat setpoint", `${f1(heatRef[i])}${unit}`]);
       if (propHeat) rows.push(["Proposed heat", `${f1(propHeat[i])}${unit}`]);
       const onOff = (v) => (v === null || v === undefined ? "-" : v >= 0.5 ? "on" : v > 0 ? `${Math.round(v * 100)}%` : "off");
-      if (cools) rows.push(["AC", onOff(future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i])]);
-      if (heatRow) rows.push(["Heat", onOff(future ? ((s.heat && (s.heat.active || s.heat.baseline)) || [])[i] : (s.heat_actual || [])[i])]);
+      const withPlan = (v, p) => (future || p === null || p === undefined ? onOff(v) : `${onOff(v)} <span style="opacity:.65">pred ${onOff(p)}</span>`);
+      if (cools) rows.push(["AC", withPlan(future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i], (s.ac_planned || [])[i])]);
+      if (heatRow) rows.push(["Heat", withPlan(future ? ((s.heat && (s.heat.active || s.heat.baseline)) || [])[i] : (s.heat_actual || [])[i], (s.heat_planned || [])[i])]);
       const man = (s.manual || []).find((m) => m.i === i);
       if (man) rows.push(["You changed", `${f1(man.from)} \u2192 ${f1(man.to)}${unit}`]);
       if (fanRow) {

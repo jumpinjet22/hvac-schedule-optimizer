@@ -1154,6 +1154,41 @@ def _under(T: list, lim: list) -> float:
     return max((v - T[i] for i, v in enumerate(lim) if v is not None), default=-99.0)
 
 
+def recovery(ctx: dict, m: dict, ti0: float, s: Settings, band, hband) -> int:
+    """Hold a house that starts outside a limit to getting back as fast as the equipment can.
+
+    A fixed grace period fails every schedule alike when the way back takes longer, so until the
+    flat-out trace is inside, each limit is eased to that trace (plus a little slack for cycling)
+    and rooms are not judged. Returns the bins eased beyond the grace period.
+    """
+    n = len(ctx["To"])
+    slack = max(0.3, s.step)
+    corr = ctx.get("corr")
+    eased = 0
+    for side in ("lim", "lim_min"):
+        lim = ctx[side]
+        first = next((j for j in range(GRACE_BINS + 1, len(lim)) if lim[j] is not None), None)
+        if first is None:
+            continue
+        hot = side == "lim"
+        if hot and (not ctx["cools"] or ti0 <= lim[first]) or not hot and (not ctx["heats"] or ti0 >= lim[first]):
+            continue
+        if hot:
+            fast = simulate(m, ctx["To"], ctx["S"], ti0, [ti0 - 50.0] * n, band, 1, corr)[0]
+        else:
+            fast = simulate(m, ctx["To"], ctx["S"], ti0, [None] * n, band, 0, corr, [ti0 + 50.0] * n, hband, 1)[0]
+        j = GRACE_BINS + 1
+        while j < len(lim) and (lim[j] is None or (fast[j] > lim[j] if hot else fast[j] < lim[j])):
+            if lim[j] is not None:
+                lim[j] = max(lim[j], fast[j] + slack) if hot else min(lim[j], fast[j] - slack)
+            j += 1
+        eased = max(eased, j - GRACE_BINS - 1)
+    for room in ctx["rooms"]:
+        for key in ("lim", "lim_min"):
+            room[key] = [None if i <= GRACE_BINS + eased else v for i, v in enumerate(room[key])]
+    return eased
+
+
 def heat_cost(To: float, gap: float, s: Settings) -> float:
     """Cost of one hour of heating, in AC hours, for the heat source in use."""
     if s.heat_kind in ("furnace", "electric"):
@@ -1721,6 +1756,7 @@ def run(inp: Inputs) -> dict[str, Any]:
     ctx["both"] = s.mode == "heat_cool"
     if corr_full is not None:
         ctx["corr"] = (corr_full[0][idx0:], corr_full[1][idx0:])
+    recovering = recovery(ctx, m, ti0, s, band, hband)
     base_nodes = sorted((int(a), float(b)) for a, b in s.baseline)
     base_heat = sorted((int(a), float(b)) for a, b in s.heat_baseline)
     # A schedule without heat values leaves the thermostat's own heat setpoint alone.
@@ -1879,6 +1915,9 @@ def run(inp: Inputs) -> dict[str, Any]:
         "limit_min": (period_limits(lm_past, s, side="min") if s.heats else [None] * past)
         + [None if v is None else round(v, 2) for v in ctx["lim_min_shown"][1:]],
         "indoor_planned": indoor_planned + [None] * inp.n_hor,
+        # What those runs expected the equipment to do, next to ac_actual and heat_actual.
+        "ac_planned": [row.get("ac") for row in plan_rows] + [None] * inp.n_hor,
+        "heat_planned": [row.get("heat") for row in plan_rows] + [None] * inp.n_hor,
         "accuracy": house_acc,
         "manual": manual,
         "rooms": [],
@@ -1958,6 +1997,22 @@ def run(inp: Inputs) -> dict[str, Any]:
         "actual_24h_hours": round(sum(actual_vals) * STEP_H, 2) if len(actual_vals) >= past * 0.8 else None,
         "start_local_minute": inp.local_minutes[0] if inp.local_minutes else 0,
     }
+
+    def past_hours(actual, key):
+        """Last 24h actual and planned hours, over the bins that have both (None when too few do)."""
+        pairs = [(actual[i], plan_rows[i - a].get(key)) for i in range(a, idx0)]
+        pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+        if len(pairs) < past * 0.5:
+            return None
+        return {
+            "actual": round(sum(x for x, _ in pairs) * STEP_H, 2),
+            "planned": round(sum(y for _, y in pairs) * STEP_H, 2),
+            "hours_covered": round(len(pairs) * STEP_H, 1),
+        }
+
+    runtime["past"] = past_hours(src, "heat" if heat_main else "ac")
+    if s.mode == "heat_cool":
+        runtime["past_heat"] = past_hours(heat_b, "heat")
     for name, r in traces.items():
         runtime[name] = run_stats((r["ht"] or [0] * inp.n_hor) if heat_main else r["on"])
         if s.mode == "heat_cool" and r["ht"]:
@@ -1986,6 +2041,7 @@ def run(inp: Inputs) -> dict[str, Any]:
         "mode": s.mode,
         "heat_kind": s.heat_kind,
         "comfort": {
+            "recovering_min": recovering * STEP_S // 60,  # starting outside a limit: eased while it gets back
             "awake_min": s.awake_min,
             "sleep_min": s.sleep_min,
             "cools": s.cools,
