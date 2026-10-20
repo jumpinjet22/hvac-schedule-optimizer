@@ -12,10 +12,11 @@ import aiohttp
 from homeassistant.components.recorder import get_instance, history
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -33,6 +34,11 @@ from .const import (
     CONF_AC_KW,
     CONF_AUX_BELOW,
     CONF_AWAKE_MIN,
+    CONF_AWAY_MAX,
+    CONF_AWAY_MIN,
+    CONF_DIRECTION,
+    CONF_PEOPLE,
+    CONF_TRAVEL,
     CONF_BASE_DAY_HEAT,
     CONF_BASE_NIGHT_HEAT,
     CONF_CLIMATE,
@@ -141,6 +147,23 @@ FORECAST_DAYS = 14  # stored plan forecasts, enough weeks of predicted vs actual
 COMFORT_DAYS = 60
 COMFORT_MAX_EVENTS = 200
 UNDO_S = 600  # a change reversed within this long was a slip, not a preference
+PRESENCE_DAYS = 28  # four of each weekday to learn routines from
+AWAY_DELAY_S = 600  # the house counts as empty once the last person has been gone this long
+TRAVEL_STALE_S = 1800  # a travel time older than this is ignored
+
+
+def _minutes(state) -> float | None:
+    """A travel time sensor's value in minutes (Waze, Google and HERE all report minutes)."""
+    v = _num(state.state) if state is not None else None
+    if v is None:
+        return None
+    unit = state.attributes.get("unit_of_measurement")
+    return v * 60 if unit == "h" else v / 60 if unit == "s" else v
+
+
+def _at_home(state) -> bool:
+    """Unknown or unavailable counts as home: never assume away when unsure."""
+    return state is None or state.state in ("home", STATE_UNAVAILABLE, STATE_UNKNOWN)
 
 
 class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -162,6 +185,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.comfort_events: list[dict] = []
         self.comfort_forgotten: dict[str, float] = {}
         self.learn_enabled = True
+        self._away_timer: CALLBACK_TYPE | None = None
 
     @property
     def _unit(self) -> str:
@@ -325,6 +349,8 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             setattr(s, k, v)
         s.aux_below = float(o[CONF_AUX_BELOW])
         s.switch_below = float(o[CONF_SWITCH_BELOW])
+        s.away_max = float(o[CONF_AWAY_MAX])
+        s.away_min = float(o[CONF_AWAY_MIN])
         return s
 
     def deadband(self) -> float:
@@ -384,6 +410,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 want, why = self._auto_mode_wanted(result)
                 if want:
                     self.hass.async_create_task(self.scheduler.async_auto_switch(want, why))
+            self.hass.async_create_task(self._async_apply_away(result))
         except Exception as err:  # noqa: BLE001 - surface any failure as a status instead of failing setup
             # Log once per distinct failure, not on every refresh.
             if str(err) != self._last_error:
@@ -481,6 +508,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             series.sort(key=lambda p: p[0])
 
         wts, wtemp, wsun = await self._fetch_weather(days)
+        people = await self._people_inputs(recorder, o, now)
 
         local_minutes = []
         for i in range(n_hor):
@@ -529,6 +557,9 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             heat=heat,  # always: heating periods must not look like "AC off" to the cooling fit
             heat_setpoint=heat_sp,
             modes=mode_pts,
+            people=people,
+            guest=self.scheduler.guest,
+            presence_days=PRESENCE_DAYS,
         )
         try:
             result = await self.hass.async_add_executor_job(engine.run, inputs)
@@ -537,6 +568,124 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         result["message"] = None
         self._last_error = None
         return result
+
+    # ---------------------------------------------------------- presence
+    def people(self) -> list[str]:
+        return list(self.config_entry.options.get(CONF_PEOPLE) or [])
+
+    def _person_home(self, entity_id: str, now: float) -> bool:
+        """Home, or left less than AWAY_DELAY_S ago (a quick trip does not count)."""
+        st = self.hass.states.get(entity_id)
+        return _at_home(st) or now - st.last_changed.timestamp() < AWAY_DELAY_S
+
+    async def _people_inputs(self, recorder, o: dict, now: float) -> list[dict]:
+        ids = self.people()
+        if not ids:
+            return []
+        start = now - PRESENCE_DAYS * 86400
+        hist = await recorder.async_add_executor_job(
+            partial(
+                history.get_significant_states,
+                self.hass,
+                dt_util.utc_from_timestamp(start),
+                dt_util.utc_from_timestamp(now),
+                entity_ids=ids,
+                include_start_time_state=True,
+                significant_changes_only=False,
+                minimal_response=False,
+                no_attributes=True,
+            )
+        )
+        out = []
+        for pid in ids:
+            points = [
+                (st.last_updated.timestamp(), None if st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN) else float(st.state == "home"))
+                for st in hist.get(pid, [])
+            ]
+            points.sort(key=lambda p: p[0])
+            eta = towards = None
+            if (sensor := (o.get(CONF_TRAVEL) or {}).get(pid)) and (ts_ := self.hass.states.get(sensor)):
+                if now - ts_.last_updated.timestamp() < TRAVEL_STALE_S:
+                    eta = _minutes(ts_)
+            if (sensor := (o.get(CONF_DIRECTION) or {}).get(pid)) and (ds := self.hass.states.get(sensor)):
+                towards = True if ds.state == "towards" else False if ds.state in ("away_from", "stationary") else None
+            st = self.hass.states.get(pid)
+            out.append(
+                {
+                    "id": pid,
+                    "name": st.name if st else pid,
+                    "points": points,
+                    "home_now": self._person_home(pid, now),
+                    "eta_min": eta,
+                    "towards": towards,
+                }
+            )
+        return out
+
+    @callback
+    def async_listen_presence(self) -> CALLBACK_TYPE:
+        """Re-plan when people come and go, and as someone out heads home."""
+        o = self.config_entry.options
+        people = self.people()
+        extra = [e for p in people for e in ((o.get(CONF_TRAVEL) or {}).get(p), (o.get(CONF_DIRECTION) or {}).get(p)) if e]
+        if not people:
+            return lambda: None
+        unsub = async_track_state_change_event(self.hass, people + extra, self._async_presence_changed)
+
+        def stop() -> None:
+            unsub()
+            if self._away_timer:
+                self._away_timer()
+                self._away_timer = None
+
+        return stop
+
+    async def _async_presence_changed(self, event: Event[EventStateChangedData]) -> None:
+        people = self.people()
+        sch = self.scheduler
+        if any(_at_home(self.hass.states.get(p)) for p in people):
+            if self._away_timer:
+                self._away_timer()
+                self._away_timer = None
+            # Someone is home: back to the schedule straight away, without waiting for the optimizer.
+            sch.away_cancelled = False
+            if sch.away:
+                await sch.async_set_away(None)
+            if event.data["entity_id"] in people and not _at_home(event.data["old_state"]):
+                await self.async_plan("arrival")
+            return
+        if event.data["entity_id"] in people:
+            # The last person left: plan the setback once they have been gone long enough.
+            if self._away_timer:
+                self._away_timer()
+
+            async def _later(_now) -> None:
+                self._away_timer = None
+                await self.async_plan("away")
+
+            self._away_timer = async_call_later(self.hass, AWAY_DELAY_S + 5, _later)
+        else:
+            await self.async_request_refresh()  # a travel time or direction changed while everyone is out
+
+    async def _async_apply_away(self, result: dict[str, Any]) -> None:
+        """Hand the planned setback to the scheduler, or end it."""
+        if result.get("status") == "error":
+            return  # keep what runs; a setback ends on its own at its end time
+        sch = self.scheduler
+        pr = result.get("presence") or {}
+        away = result.get("away")
+        if not (pr.get("house_away") and away and sch.enabled and result.get("validated")) or sch.away_cancelled or sch.guest:
+            if sch.away:
+                await sch.async_set_away(None)
+            return
+        start = sch.away["start"] if sch.away else away["start_ts"]
+        await sch.async_set_away(
+            {"start": start, "end": away["end_ts"], "return": away["return_ts"], "temp": away["temp"], "heat": away["heat"]}
+        )
+
+    async def async_set_guest(self, value: bool) -> None:
+        await self.scheduler.async_set_guest(value)
+        await self.async_refresh()
 
     def _sensor_points(self, states: list) -> list[tuple[float, float | None]]:
         """Recorder states of a temperature sensor as sorted points in the Home Assistant unit."""

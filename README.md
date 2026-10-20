@@ -7,7 +7,7 @@ its model actually matches reality, then designs a daily schedule that uses less
 while staying inside comfort limits you set. It also runs the schedule itself, so you do not
 need another scheduler integration.
 
-> Version 0.6. Cooling and heating. Single thermostat per entry. Includes a dashboard card.
+> Version 0.7. Cooling, heating and presence. Single thermostat per entry. Includes a dashboard card.
 
 ## How it works
 
@@ -71,6 +71,38 @@ Heating works the same way, for any common setup:
   cold room, a cold day, or that time of day) raises that minimum, with the same limits and
   fading as on the cooling side.
 
+### Presence
+
+Pick everyone who lives in the house (their `person` entities) on the **Presence** options page.
+While all of them are out, the house may drift to the **away limits** (82 °F / 28 °C cooling, 60 °F /
+15.5 °C heating by default), and it is back inside your normal limits when the first person is
+expected home.
+
+- **Routines are learned per person** from the last four weeks of their tracker history, for each
+  weekday (or workdays and weekends until there are three of each). Someone is expected back once
+  they are usually home at that time on at least a quarter of those days.
+- **The house only counts as empty** once the last person has been gone 10 minutes, so a quick
+  trip does not start a setback. Anyone home, or a tracker that is unavailable, means home.
+- **The setback is one-off, not part of the schedule.** It is set with a fixed start and end, laid
+  over whatever schedule runs, and the optimizer picks how deep and when to hand back to the
+  schedule so the house recovers in time. It never repeats the next day.
+- **Coming home ends it at once**, before the optimizer even runs. Changing the setpoint from the
+  app while out also ends it (and it waits until someone is home again before setting back again).
+- **Travel time (optional):** on each person's page, pick a travel time sensor (Waze Travel Time,
+  Google Travel Time or HERE, from that person to home, in minutes) and a Proximity *direction of
+  travel* sensor. Someone heading home sooner than usual brings the recovery forward, and nobody is
+  expected back sooner than their drive. A travel time older than 30 minutes is ignored.
+- It runs only while **Run schedule** is on and the house model is trusted. Turn on **Guest mode**
+  while someone without a tracker is home.
+
+Setting up Waze for a person: **Add integration, Waze Travel Time**, origin `person.<name>`,
+destination `zone.home`. For direction: **Add integration, Proximity**, zone Home, and track
+everyone's person entity.
+
+With a small AC on a very hot day, a setback saves less than you might expect, because the heat
+the house soaks up has to be removed again before you get home. The card shows the plan and the
+estimated change.
+
 ### Learning from your changes
 
 When you change the setpoint yourself (in the app or at the wall) while the schedule is running,
@@ -132,6 +164,8 @@ folder and restart.
      temperatures for awake and sleep hours, your current heat setpoints, the smallest gap your
      thermostat allows between heat and cool setpoints, and (for thermostats without heat_cool)
      whether the integration may switch modes for you.
+   - **Presence** (optional): the people who live here, the away limits, and for each person an
+     optional travel time sensor and direction of travel sensor. See [Presence](#presence).
    - **Costs**: AC power, electricity price, and only what your heat source needs (gas price and
      furnace rating, electric heat power, or backup strip power and lockout temperature).
 3. How the fan is used: every room learns how much the blower running on its own evens it out,
@@ -156,6 +190,7 @@ folder and restart.
 | `switch.*_run_schedule` | On: this integration sets the thermostat at each node time. |
 | `switch.*_auto_apply_optimizer` | On: the daily run replaces the active schedule when the model is trusted. |
 | `switch.*_learn_from_my_changes` | On: manual setpoint changes are kept and repeated turn-downs tighten the comfort limits. |
+| `switch.*_guest_mode` | On: the house counts as occupied, so no away setback (only with people set). |
 | `button.*_optimize_now` | Run the optimizer immediately. |
 | `button.*_apply_proposed_schedule` | Make the proposal the active schedule (refused if the model is not trusted). |
 | `button.*_revert_schedule` | Go back to the previous schedule. |

@@ -23,6 +23,11 @@ from .const import (
     CONF_AUX_BELOW,
     CONF_AUX_KW,
     CONF_AWAKE_MIN,
+    CONF_AWAY_MAX,
+    CONF_AWAY_MIN,
+    CONF_DIRECTION,
+    CONF_PEOPLE,
+    CONF_TRAVEL,
     CONF_BASE_DAY_HEAT,
     CONF_BASE_NIGHT_HEAT,
     CONF_CLIMATE,
@@ -99,13 +104,14 @@ def _temp_sensors() -> selector.EntitySelector:
 class OptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
+        self._people_left: list[str] = []
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
             self._data = {**user_input, CONF_ROOM_WHEN: {}}
             if user_input.get(CONF_ROOM_SENSORS):
                 return await self.async_step_rooms()
-            return await self.async_step_fan()
+            return await self.async_step_presence()
 
         fahrenheit = self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
         cur = {**default_options(fahrenheit), **self.config_entry.options}
@@ -137,7 +143,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         rooms = self._data[CONF_ROOM_SENSORS]
         if user_input is not None:
             self._data[CONF_ROOM_WHEN] = dict(user_input)
-            return await self.async_step_fan()
+            return await self.async_step_presence()
 
         current = self.config_entry.options.get(CONF_ROOM_WHEN, {})
         when = selector.SelectSelector(
@@ -152,6 +158,51 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             f"{r} = {(st.name if (st := self.hass.states.get(r)) else r)}" for r in rooms
         )
         return self.async_show_form(step_id="rooms", data_schema=schema, description_placeholders={"names": names})
+
+    async def async_step_presence(self, user_input: dict[str, Any] | None = None):
+        """Who lives here, and how loose the limits get while everyone is out."""
+        if user_input is not None:
+            self._data.update(user_input)
+            self._data.setdefault(CONF_PEOPLE, [])
+            self._data[CONF_TRAVEL], self._data[CONF_DIRECTION] = {}, {}
+            self._people_left = list(self._data[CONF_PEOPLE])
+            return await self.async_step_person()
+        cur, fahrenheit = self._cur()
+        t_lo, t_hi, t_step = (45, 95, 1) if fahrenheit else (7, 35, 0.5)
+        fields: dict[Any, Any] = {
+            vol.Optional(CONF_PEOPLE, default=list(cur[CONF_PEOPLE])): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="person", multiple=True)
+            ),
+            vol.Required(CONF_AWAY_MAX, default=cur[CONF_AWAY_MAX]): _box(t_lo, t_hi, t_step),
+        }
+        modes = thermostat_modes(self.hass.states.get(self.config_entry.data[CONF_CLIMATE]))
+        if "heat" in modes or "heat_cool" in modes:
+            fields[vol.Required(CONF_AWAY_MIN, default=cur[CONF_AWAY_MIN])] = _box(t_lo, t_hi, t_step)
+        return self.async_show_form(step_id="presence", data_schema=vol.Schema(fields))
+
+    async def async_step_person(self, user_input: dict[str, Any] | None = None):
+        """One page per person: their travel time and direction sensors, both optional."""
+        if user_input is not None:
+            pid = self._people_left.pop(0)
+            if user_input.get("travel_sensor"):
+                self._data[CONF_TRAVEL][pid] = user_input["travel_sensor"]
+            if user_input.get("direction_sensor"):
+                self._data[CONF_DIRECTION][pid] = user_input["direction_sensor"]
+        if not self._people_left:
+            return await self.async_step_fan()
+        pid = self._people_left[0]
+        old = self.config_entry.options
+        fields: dict[Any, Any] = {}
+        for key, saved in (
+            ("travel_sensor", (old.get(CONF_TRAVEL) or {}).get(pid)),
+            ("direction_sensor", (old.get(CONF_DIRECTION) or {}).get(pid)),
+        ):
+            k = vol.Optional(key, default=saved) if saved else vol.Optional(key)
+            fields[k] = selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
+        st = self.hass.states.get(pid)
+        return self.async_show_form(
+            step_id="person", data_schema=vol.Schema(fields), description_placeholders={"name": st.name if st else pid}
+        )
 
     async def async_step_fan(self, user_input: dict[str, Any] | None = None):
         """Only shown when the thermostat reports fan modes; the dropdowns list its own mode names."""

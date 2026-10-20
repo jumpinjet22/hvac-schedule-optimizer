@@ -821,3 +821,111 @@ def test_hot_start_recovers_instead_of_failing_every_schedule():
 def test_inside_the_limits_nothing_is_eased():
     inp, _ = _synthetic()
     assert engine.run(inp)["comfort"]["recovering_min"] == 0
+
+
+# ------------------------------------------------------------------ presence
+def _routine(t_end, leave=8 * 60, back=17 * 60 + 30, days=28, weekend_home=True):
+    """A person's home/away points: out on workdays from leave to back (local), home otherwise."""
+    pts = []
+    t = t_end - days * 86400
+    while t < t_end:
+        lm = _local_min(t)
+        wd = engine.weekday(engine.local_day(t, lm))
+        out = (wd < 5 or not weekend_home) and leave <= lm < back
+        pts.append((t, 0.0 if out else 1.0))
+        t += STEP
+    return pts
+
+
+def _person(inp, name="a", home_now=False, **kw):
+    eta = kw.pop("eta_min", None)
+    towards = kw.pop("towards", None)
+    return {"id": f"person.{name}", "name": name, "points": _routine(inp.data_end, **kw), "home_now": home_now,
+            "eta_min": eta, "towards": towards}
+
+
+def test_learn_presence_weekday_and_weekend_patterns():
+    inp, _ = _synthetic()
+    pts = _routine(inp.data_end)
+    n = 28 * 96
+    g0 = inp.data_end - n * STEP
+    home = engine.resample(pts, g0, n, inp.data_end)
+    learned = engine.learn_presence(home, g0, _local_min(g0), inp.settings)
+    wed, sat = learned["profiles"][2], learned["profiles"][5]
+    assert learned["days"] >= 26
+    assert wed[12 * 4] < 0.05 and wed[20 * 4] > 0.95 and wed[7 * 4] > 0.95
+    assert sat[12 * 4] > 0.95
+
+
+def test_everyone_out_sets_back_and_is_back_in_limits_for_the_return():
+    inp, _ = _synthetic()  # 12:45 on a Wednesday, a hot afternoon
+    inp.active_nodes = [{"time": "08:00", "temp": 74}, {"time": "22:00", "temp": 70}]
+    home = engine.run(inp)
+    inp.people = [_person(inp)]
+    r = engine.run(inp)
+    pr, away = r["presence"], r["away"]
+    assert pr["house_away"] and pr["window"] and pr["people"][0]["source"] == "learned"
+    assert _local_min(pr["return_ts"]) == 17 * 60 + 15  # home a quarter of the time by then, after smoothing
+    assert away is not None and away["temp"] > 74 and away["end_ts"] <= pr["return_ts"]
+    s = r["series"]
+    j_r = (pr["return_ts"] - inp.data_end) // STEP
+    ni = s["now_index"]
+    # back inside the awake limit when they walk in, and cheaper than running the day schedule
+    assert max(s["indoor"]["active"][ni + j_r : ni + j_r + 8]) <= inp.settings.awake_max + 0.05, s["indoor"]["active"][ni : ni + j_r + 8]
+    assert r["active"]["energy_index"] < home["active"]["energy_index"] * 0.98
+    assert s["home"][ni] == 0 and s["home"][ni + j_r] == 1
+    assert max(v for v in s["limit"][ni : ni + j_r] if v is not None) == inp.settings.away_max
+
+
+def test_nobody_away_or_a_guest_means_no_setback():
+    inp, _ = _synthetic()
+    inp.people = [_person(inp, home_now=True)]
+    r = engine.run(inp)
+    assert r["away"] is None and not r["presence"]["house_away"] and not r["presence"]["window"]
+    inp.people = [_person(inp)]
+    inp.guest = True
+    r = engine.run(inp)
+    assert r["away"] is None and r["presence"]["guest"]
+
+
+def test_first_person_back_decides_and_anyone_home_cancels():
+    inp, _ = _synthetic()
+    inp.people = [_person(inp, "a"), _person(inp, "b", back=15 * 60)]
+    r = engine.run(inp)
+    assert _local_min(r["presence"]["return_ts"]) == 14 * 60 + 45
+    inp.people = [_person(inp, "a"), _person(inp, "b", home_now=True)]
+    assert engine.run(inp)["away"] is None
+
+
+def test_travel_time_moves_the_return():
+    inp, _ = _synthetic()
+    inp.people = [_person(inp, eta_min=120, towards=True)]
+    pr = engine.run(inp)["presence"]
+    assert pr["people"][0]["source"] == "travel" and (pr["return_ts"] - inp.data_end) // STEP == 8
+    inp.people = [_person(inp, eta_min=20, towards=True)]
+    r = engine.run(inp)
+    assert not r["presence"]["window"] and r["away"] is None  # back too soon to bother
+
+
+def test_unknown_routine_counts_as_home_unless_the_drive_is_long():
+    inp, _ = _synthetic()
+    inp.people = [_person(inp, days=1)]  # one day of history: no pattern yet
+    r = engine.run(inp)
+    assert r["presence"]["people"][0]["source"] == "unknown" and r["away"] is None
+    inp.people = [_person(inp, days=1, eta_min=180, towards=False)]
+    r = engine.run(inp)
+    assert r["presence"]["people"][0]["source"] == "travel" and (r["presence"]["return_ts"] - inp.data_end) // STEP == 12
+
+
+def test_heating_sets_back_while_away():
+    inp, _ = _winter()
+    inp.active_nodes = engine.run(inp)["best"]["nodes"]
+    inp.people = [_person(inp)]
+    r = engine.run(inp)
+    away = r["away"]
+    assert r["presence"]["window"]
+    assert away is not None and away["heat"] is not None and away["heat"] < inp.settings.awake_min
+    s, pr = r["series"], r["presence"]
+    j_r = (pr["return_ts"] - inp.data_end) // STEP
+    ni = s["now_index"]
+    assert min(s["indoor"]["active"][ni + j_r : ni + j_r + 8]) >= inp.settings.awake_min - 0.05

@@ -52,6 +52,12 @@ CONF_ELEC_HEAT_KW = "electric_heat_kw"
 CONF_AUX_KW = "aux_kw"
 CONF_AUX_BELOW = "aux_below"
 CONF_SWITCH_BELOW = "switch_below"
+# Presence
+CONF_PEOPLE = "people"
+CONF_TRAVEL = "travel_sensors"  # {person: travel time sensor in minutes}
+CONF_DIRECTION = "direction_sensors"  # {person: proximity direction of travel sensor}
+CONF_AWAY_MAX = "away_max"
+CONF_AWAY_MIN = "away_min"
 
 HEAT_KINDS = ["furnace", "electric", "heat_pump", "dual_fuel", "none"]
 COOL_MODES = ("cool",)
@@ -99,6 +105,11 @@ def default_options(fahrenheit: bool) -> dict[str, Any]:
         CONF_AUX_KW: 10.0,
         CONF_AUX_BELOW: s.aux_below,
         CONF_SWITCH_BELOW: s.switch_below,
+        CONF_PEOPLE: [],
+        CONF_TRAVEL: {},
+        CONF_DIRECTION: {},
+        CONF_AWAY_MAX: s.away_max,
+        CONF_AWAY_MIN: s.away_min,
     }
 
 

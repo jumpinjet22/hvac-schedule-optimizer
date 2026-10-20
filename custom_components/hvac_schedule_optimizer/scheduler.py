@@ -43,6 +43,10 @@ class Scheduler:
     schedule has heat values), in heat_cool both, never closer than deadband(). Other
     modes (off, dry, fan only) are left alone. With auto switching opted in, the
     coordinator asks for heat or cool through async_auto_switch.
+
+    Away: while everyone is out the coordinator sets a one-off setback with fixed start and
+    end times, laid over the schedule, so it never repeats the next day. It ends at its end
+    time, the moment anyone comes home, or when someone changes the setpoint by hand.
     """
 
     def __init__(self, hass: HomeAssistant, entry_id: str, climate_entity: str, default_nodes: list[dict]) -> None:
@@ -70,6 +74,9 @@ class Scheduler:
         self.mode_switched_at: float | None = None
         self.manual_mode_at: float | None = None
         self.mode_note: str | None = None
+        self.away: dict[str, Any] | None = None  # {"start", "end", "return" epochs, "temp", "heat"}
+        self.away_cancelled = False  # a manual change while away: no setback until someone is home again
+        self.guest = False
 
     # ---------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -84,6 +91,9 @@ class Scheduler:
         self.auto_apply = bool(data.get("auto_apply", False))
         self.last_set = data.get("last_set")
         self.fan_forced = bool(data.get("fan_forced", False))
+        self.away = data.get("away")
+        self.away_cancelled = bool(data.get("away_cancelled", False))
+        self.guest = bool(data.get("guest", False))
 
     async def _async_save(self) -> None:
         await self._store.async_save(
@@ -96,6 +106,9 @@ class Scheduler:
                 "auto_apply": self.auto_apply,
                 "last_set": self.last_set,
                 "fan_forced": self.fan_forced,
+                "away": self.away,
+                "away_cancelled": self.away_cancelled,
+                "guest": self.guest,
             }
         )
 
@@ -151,6 +164,17 @@ class Scheduler:
                 self.manual_mode_at = dt_util.utcnow().timestamp()  # someone picked a mode: auto switching backs off
             return
         if run_mode(new) is None or not self.enabled or self.on_manual_change is None or self._ours(new.context):
+            return
+        changed = any(
+            b is not None and a is not None and abs(b - a) >= 1e-6 and not self._echo(k, a)
+            for b, a, k in zip(setpoints_of(old), setpoints_of(new), ("temp", "heat"))
+        )
+        if changed and self.away_now() is not None:
+            # Someone set it from the app while out: respect it, and do not learn comfort from it.
+            self.away, self.away_cancelled = None, True
+            await self._async_save()
+            self._arm()
+            self._notify()
             return
         source = "ui" if new.context.user_id else "device"
         for (before, after), side, key in zip(zip(setpoints_of(old), setpoints_of(new)), ("cool", "heat"), ("temp", "heat")):
@@ -218,13 +242,45 @@ class Scheduler:
             self._arm()
         self._notify()
 
+    # ---------------------------------------------------------- away
+    def away_now(self, now: datetime | None = None) -> dict[str, Any] | None:
+        """The away setback when it covers this moment."""
+        if not self.away:
+            return None
+        t = (now or dt_util.utcnow()).timestamp()
+        return self.away if self.away["start"] <= t < self.away["end"] else None
+
+    async def async_set_away(self, away: dict[str, Any] | None) -> None:
+        """Start, move or end the away setback, and set the thermostat to match."""
+        if away == self.away:
+            return
+        self.away = away
+        await self._async_save()
+        if self.enabled:
+            await self._async_apply_current()
+            self._arm()
+        self._notify()
+
+    async def async_set_guest(self, value: bool) -> None:
+        self.guest = value
+        await self._async_save()
+        if value and self.away:
+            await self.async_set_away(None)
+        self._notify()
+
     # ---------------------------------------------------------- timing
     def current_setpoint(self, now: datetime | None = None) -> float:
+        away = self.away_now(now)
+        if away and away.get("temp") is not None:
+            return float(away["temp"])
         now = dt_util.as_local(now or dt_util.now())
         return engine.setpoint_at(self.nodes, now.hour * 60 + now.minute)
 
     def current_heat(self, now: datetime | None = None) -> float | None:
         """Heat setpoint the schedule asks for now, or None when the schedule has no heat values."""
+        away = self.away_now(now)
+        if away and away.get("heat") is not None:
+            return float(away["heat"])
         plan = engine.heat_plan(self.nodes)
         if not plan:
             return None
@@ -250,6 +306,9 @@ class Scheduler:
             "setpoint_now": self.current_setpoint(),
             "heat_now": self.current_heat(),
             "mode_note": self.mode_note,
+            "away": self.away_now(),
+            "away_cancelled": self.away_cancelled,
+            "guest": self.guest,
             "next_change": when.isoformat(),
             "next_temp": temp,
             "climate_entity": self.climate_entity,
@@ -262,6 +321,8 @@ class Scheduler:
     def _arm(self) -> None:
         self.async_stop()
         when, _ = self.next_change()
+        if (away := self.away_now()) is not None:
+            when = min(when, dt_util.as_local(dt_util.utc_from_timestamp(away["end"])))  # back to the schedule
         self._unsub = async_track_point_in_time(self.hass, self._async_fire, when)
 
     async def _async_fire(self, now: datetime) -> None:

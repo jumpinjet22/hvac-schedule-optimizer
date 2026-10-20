@@ -1,4 +1,5 @@
-"""Switches: run the schedule, let the optimizer replace it automatically, learn from manual changes."""
+"""Switches: run the schedule, let the optimizer replace it automatically, learn from manual changes,
+and guest mode (someone without a tracker is home, so no away setback)."""
 
 from __future__ import annotations
 
@@ -15,7 +16,10 @@ from .coordinator import OptimizerCoordinator
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator: OptimizerCoordinator = entry.runtime_data.coordinator
-    async_add_entities([SchedulerSwitch(coordinator), AutoApplySwitch(coordinator), LearnSwitch(coordinator)])
+    entities = [SchedulerSwitch(coordinator), AutoApplySwitch(coordinator), LearnSwitch(coordinator)]
+    if coordinator.people():
+        entities.append(GuestSwitch(coordinator))
+    async_add_entities(entities)
 
 
 class _Base(SwitchEntity):
@@ -91,3 +95,20 @@ class LearnSwitch(_Base):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._coordinator.async_set_learn(False)
+
+
+class GuestSwitch(_Base):
+    """When on, the house counts as occupied whoever's phone is where: no away setback."""
+
+    def __init__(self, coordinator: OptimizerCoordinator) -> None:
+        super().__init__(coordinator, "guest_mode", "Guest mode", "mdi:account-group")
+
+    @property
+    def is_on(self) -> bool:
+        return self._scheduler.guest
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_guest(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._coordinator.async_set_guest(False)

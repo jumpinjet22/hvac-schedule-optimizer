@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.6.0-beta.2"
+CARD_VERSION = "0.7.0-beta.1"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -136,6 +136,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OptimizerConfigEntry) ->
     )
     entry.async_on_unload(scheduler.async_stop)
     entry.async_on_unload(scheduler.async_listen())
+    entry.async_on_unload(coordinator.async_listen_presence())
     entry.async_on_unload(entry.add_update_listener(_async_reload))
 
     async def _started(_: HomeAssistant) -> None:

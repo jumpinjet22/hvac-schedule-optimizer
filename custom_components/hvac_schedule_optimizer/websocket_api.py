@@ -103,7 +103,7 @@ async def ws_revert(hass: HomeAssistant, connection: websocket_api.ActiveConnect
 @websocket_api.websocket_command(
     {
         vol.Required("type"): f"{DOMAIN}/toggle",
-        vol.Required("what"): vol.In(["run", "auto_apply", "learn"]),
+        vol.Required("what"): vol.In(["run", "auto_apply", "learn", "guest"]),
         vol.Required("value"): bool,
         vol.Optional("climate_entity"): str,
     }
@@ -118,6 +118,8 @@ async def ws_toggle(hass: HomeAssistant, connection: websocket_api.ActiveConnect
             await sched.async_set_enabled(msg["value"])
         elif msg["what"] == "learn":
             await entry.runtime_data.coordinator.async_set_learn(msg["value"])
+        elif msg["what"] == "guest":
+            await entry.runtime_data.coordinator.async_set_guest(msg["value"])
         else:
             await sched.async_set_auto_apply(msg["value"])
     except HomeAssistantError as err:

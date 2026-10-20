@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.6.0-beta.2";
+const CARD_VERSION = "0.7.0-beta.1";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -76,6 +76,7 @@ svg text { font-family: var(--paper-font-body1_-_font-family, inherit); fill: va
 .msg { margin-top: 12px; padding: 9px 12px; border-radius: 10px; font-size: .8rem; line-height: 1.4;
   background: color-mix(in srgb, var(--hso-warn) 14%, transparent); color: var(--primary-text-color); }
 .msg.bad { background: color-mix(in srgb, var(--hso-bad) 14%, transparent); }
+.msg.info { background: color-mix(in srgb, var(--hso-good) 12%, transparent); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 button.b { font: inherit; font-size: .82rem; font-weight: 500; border: 0; border-radius: 999px; padding: 8px 16px; cursor: pointer;
   background: var(--secondary-background-color, rgba(127,127,127,.12)); color: var(--primary-text-color); transition: filter .15s, opacity .15s; }
@@ -326,6 +327,18 @@ class HvacScheduleCard extends HTMLElement {
       lines.push(["warn", `Fan control is on, but no room has learned what the fan does yet (${f1(fan.history_fan_only_hours)} of 4 fan-only hours in history). Run the fan on circulate for a few evenings so it can learn.`]);
     if (sch.fan_note) lines.push(["warn", `Fan held at normal: ${sch.fan_note}.`]);
     if (sch.mode_note) lines.push(["warn", `${sch.mode_note}.`]);
+    const pr = r.presence;
+    const at = (ts) => (ts ? fmtClock(new Date(ts * 1000).getHours() * 60 + new Date(ts * 1000).getMinutes()) : "");
+    if (sch.away) {
+      const first = pr && (pr.people || []).filter((p) => p.return_ts === pr.return_ts)[0];
+      const why = first ? ` (${this._esc(first.name)}, ${first.source === "travel" ? "travel time" : "usual time"})` : "";
+      const set = [sch.away.temp !== null && sch.away.temp !== undefined ? `${f1(sch.away.temp)}${unit}` : null, sch.away.heat !== null && sch.away.heat !== undefined ? `heat ${f1(sch.away.heat)}${unit}` : null].filter(Boolean).join(", ");
+      lines.push(["info", `Everyone is out: set back to ${set} until ${at(sch.away.end)}, back to comfort for ${at(sch.away.return)}${why}.`]);
+    } else if (pr && pr.house_away) {
+      const why = sch.guest ? "Guest mode is on" : sch.away_cancelled ? "the setpoint was changed by hand while out, so it waits until someone is home"
+        : !sch.enabled ? "Run schedule is off" : !r.validated ? "the house model is not trusted yet" : !pr.window ? "someone is expected back too soon" : "it would not save anything";
+      lines.push(["info", `Everyone is out, no setback: ${why}.`]);
+    }
     if (r.comfort && r.comfort.recovering_min > 0)
       lines.push(["warn", `The house is outside its comfort limits right now. The plan gets it back as fast as the equipment can (about ${Math.round(r.comfort.recovering_min + 30)} min), then holds the limits again.`]);
     if (r.comfort && r.comfort.heats && !r.heat_learned && r.status !== "error")
@@ -334,7 +347,7 @@ class HvacScheduleCard extends HTMLElement {
     if (gap !== null && gap !== undefined && Math.abs(gap) >= (unit === "\u00b0C" ? 0.6 : 1))
       lines.push(["warn", `Your indoor sensor reads ${f1(Math.abs(gap))}${unit} ${gap < 0 ? "below" : "above"} the thermostat, and the thermostat controls to its own reading. The learned switching points account for it.`]);
     if (this._notice) lines.push(["bad", this._notice]);
-    msgs.innerHTML = lines.map(([t, m]) => `<div class="msg ${t === "bad" ? "bad" : ""}">${this._esc(m)}</div>`).join("");
+    msgs.innerHTML = lines.map(([t, m]) => `<div class="msg ${t === "bad" ? "bad" : t === "info" ? "info" : ""}">${this._esc(m)}</div>`).join("");
 
     const nodes = wrap.querySelector(".nodes");
     const pillTemp = (n) =>
@@ -361,7 +374,9 @@ class HvacScheduleCard extends HTMLElement {
     toggles.innerHTML = `
       <label class="tg"><input type="checkbox" data-t="run" ${sch.enabled ? "checked" : ""}><span class="sw"></span>Run schedule</label>
       <label class="tg"><input type="checkbox" data-t="auto_apply" ${sch.auto_apply ? "checked" : ""}><span class="sw"></span>Auto apply daily</label>
-      <label class="tg"><input type="checkbox" data-t="learn" ${this._state.learn !== false ? "checked" : ""}><span class="sw"></span>Learn from my changes</label>`;
+      <label class="tg"><input type="checkbox" data-t="learn" ${this._state.learn !== false ? "checked" : ""}><span class="sw"></span>Learn from my changes</label>${
+        r.presence ? `<label class="tg"><input type="checkbox" data-t="guest" ${sch.guest ? "checked" : ""}><span class="sw"></span>Guest mode</label>` : ""
+      }`;
     toggles.querySelectorAll("input").forEach((i) =>
       i.addEventListener("change", () => this._act("toggle", { what: i.dataset.t, value: i.checked }))
     );
@@ -511,7 +526,8 @@ class HvacScheduleCard extends HTMLElement {
     const heats = !!(r.comfort && r.comfort.heats);
     const cools = !(r.comfort && r.comfort.cools === false);
     const heatRow = heats || [].concat(s.heat_actual || []).some((v) => v);
-    const rowsN = (cools ? 2 : 0) + (heatRow ? 2 : 0) + (fanRow ? 1 : 0) || 1;
+    const homeRow = (s.home || []).some((v) => v !== null && v !== undefined);
+    const rowsN = (cools ? 2 : 0) + (heatRow ? 2 : 0) + (fanRow ? 1 : 0) + (homeRow ? 1 : 0) || 1;
     const acArea = acH * rowsN + acGap * (rowsN - 1) + 10;
     const px0 = pad.l, px1 = W - pad.r;
     const py0 = pad.t, py1 = H - pad.b - acArea;
@@ -666,6 +682,10 @@ class HvacScheduleCard extends HTMLElement {
       strip(pred ? "pred" : "new", pred ? s.heat_planned : null, (s.heat && s.heat.proposed) || [], "#ff7043", true, true, pred && s.heat && s.heat.proposed ? "new" : null);
     }
     if (fanRow) strip("fan", s.fan_actual || [], s.fan.proposed || s.fan.active || s.fan.baseline || [], "#26a69a", true);
+    if (homeRow) {
+      const out = s.home.map((v) => (v === 0 ? 1 : 0));
+      strip("away", out, out, "var(--secondary-text-color, #727272)", false);
+    }
 
     // now marker
     el("line", { x1: xNow, x2: xNow, y1: py0 - 4, y2: py1 + acArea, stroke: "var(--primary-text-color, #212121)", "stroke-opacity": 0.5, "stroke-width": 1 }, svg);
@@ -703,6 +723,7 @@ class HvacScheduleCard extends HTMLElement {
       const withPlan = (v, p) => (future || p === null || p === undefined ? onOff(v) : `${onOff(v)} <span style="opacity:.65">pred ${onOff(p)}</span>`);
       if (cools) rows.push(["AC", withPlan(future ? (s.ac.active || s.ac.baseline || [])[i] : s.ac_actual[i], (s.ac_planned || [])[i])]);
       if (heatRow) rows.push(["Heat", withPlan(future ? ((s.heat && (s.heat.active || s.heat.baseline)) || [])[i] : (s.heat_actual || [])[i], (s.heat_planned || [])[i])]);
+      if (homeRow && s.home[i] !== null && s.home[i] !== undefined) rows.push([future ? "Home (expected)" : "Home", s.home[i] ? "someone" : "everyone out"]);
       const man = (s.manual || []).find((m) => m.i === i);
       if (man) rows.push(["You changed", `${f1(man.from)} \u2192 ${f1(man.to)}${unit}`]);
       if (fanRow) {

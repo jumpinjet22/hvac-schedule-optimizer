@@ -135,6 +135,12 @@ class Settings:
     switch_below: float = 35.0
     hp_temp_coef: float = 0.02
     ref_heat: float = 47.0
+    # Presence: looser limits while everyone is out, back to comfort by the first person's return.
+    away_max: float = 82.0
+    away_min: float = 60.0
+    presence_return_p: float = 0.25  # expected back once they are home this often at that time
+    presence_min_days: int = 3  # days of a weekday (or workday/weekend) before its pattern is used
+    away_min_bins: int = 4  # a setback shorter than an hour is not worth it
 
     @classmethod
     def defaults(cls, fahrenheit: bool = True) -> "Settings":
@@ -166,6 +172,8 @@ class Settings:
             switch_below=1.7,
             hp_temp_coef=0.036,
             ref_heat=8.3,
+            away_max=28.0,
+            away_min=15.5,
         )
 
     @property
@@ -207,6 +215,11 @@ class Inputs:
     heat: list = field(default_factory=list)  # [(epoch, 1.0 heating / 0.0 not / None unknown)]
     heat_setpoint: list = field(default_factory=list)  # [(epoch, heating setpoint or None)]
     modes: list = field(default_factory=list)  # [(epoch, "cool"|"heat"|"heat_cool"|"off"|None)]; empty = cool
+    # People: [{"id", "name", "points": [(epoch, 1.0 home / 0.0 away / None)], "home_now": bool,
+    #   "eta_min": minutes from home or None, "towards": heading home (True/False) or None}]
+    people: list = field(default_factory=list)
+    guest: bool = False  # someone without a tracker is home: never away
+    presence_days: int = 28  # how far back `points` reach
 
 
 # ------------------------------------------------------------------ helpers
@@ -1104,8 +1117,11 @@ def make_ctx(
     humidity: float | None = None,
     cools: bool | None = None,
     heats: bool | None = None,
+    away: list | None = None,
 ) -> dict:
     """rooms: [{"id", "coef", "when"}] for the trusted rooms that limit the search.
+
+    away: per forecast bin, True while everyone is out: the away limits replace the others there.
 
     learned: comfort rules that tighten a limit, {"kind": "house"|"room", "room", "side": "max"|"min",
     "start", "end", "max" (the limit value), "cond"}. Limits are per bin and checked at the bin's
@@ -1126,6 +1142,10 @@ def make_ctx(
                     _tighten(lo, rule, local_minutes, To_h, humidity)
             elif cools:
                 _tighten(hi, rule, local_minutes, To_h, humidity)
+        for j, out in enumerate(away or []):
+            if out:
+                hi[j] = None if hi[j] is None else max(hi[j], s.away_max)
+                lo[j] = None if lo[j] is None else min(lo[j], s.away_min)
         return [None] + hi, [None] + lo
 
     def grace(lim):
@@ -1220,15 +1240,23 @@ def evaluate(
     fan: list | None = None,
     heat: list | None = None,
     heat0: int = 0,
+    away: tuple | None = None,
 ) -> dict:
     """nodes: cooling setpoint steps [(minute, temp)]. heat: heating setpoint steps, used while the
-    thermostat can heat. fan: [(minute, bool)] steps, the blower circulates while True."""
+    thermostat can heat. fan: [(minute, bool)] steps, the blower circulates while True.
+    away: (first bin, end bin, cool, heat) a one-off setback over those bins (None keeps a side)."""
     lm = ctx["lm"]
     if ctx.get("both") and heat:
         nodes = lift_cool(nodes, heat, s)
     temps = [x[1] for x in nodes]
     sp = _steps(nodes, lm) if ctx.get("cools", True) else [None] * len(lm)
     sph = _steps(heat, lm) if ctx.get("heats") else None
+    if away:
+        j0, j1, ct, hh = away
+        if ct is not None and ctx.get("cools", True):
+            sp = sp[:j0] + [ct] * (j1 - j0) + sp[j1:]
+        if hh is not None and sph is not None:
+            sph = sph[:j0] + [hh] * (j1 - j0) + sph[j1:]
     if sph is not None:
         Ti, on, ht = simulate(m, ctx["To"], ctx["S"], ti0, sp, model_band(m, s), on0, ctx.get("corr"), sph, model_hband(m, s), heat0)
     else:
@@ -1258,6 +1286,7 @@ def evaluate(
         "nodes": nodes,
         "fan": fan,
         "heat": heat,
+        "away": away,
         "energy": energy,
         "hours": sum(on) * STEP_H,
         "heat_hours": sum(ht) * STEP_H if ht else 0.0,
@@ -1551,6 +1580,143 @@ def ev_day_start(day: int) -> float:
     return day * 86400.0
 
 
+# ------------------------------------------------------------------ presence
+def local_day(ts: float, lm: int) -> int:
+    """Local calendar day number of an epoch, given its local minute of day."""
+    off = (lm * 60 - int(ts) % 86400) % 86400
+    if off > 14 * 3600:
+        off -= 86400
+    return int((ts + off) // 86400)
+
+
+def weekday(day: int) -> int:
+    return (day + 3) % 7  # day 0 (1970-01-01) was a Thursday; Monday is 0
+
+
+def learn_presence(home: list, ts0: int, lm0: int, s: Settings) -> dict:
+    """How often a person is home at each 15 minutes of each weekday, from their history.
+
+    home: per-bin 1/0/None from ts0, whose local minute is lm0. A weekday's own pattern is used
+    once it has presence_min_days days, otherwise the workday or weekend pattern.
+    """
+    slots = 1440 // (STEP_S // 60)
+    days: dict[int, list] = {}
+    for i, v in enumerate(home):
+        if v is None:
+            continue
+        lm = (lm0 + i * (STEP_S // 60)) % 1440
+        days.setdefault(local_day(ts0 + i * STEP_S, lm), [None] * slots)[lm // (STEP_S // 60)] = v
+    full = {d: row for d, row in days.items() if sum(x is not None for x in row) >= slots * 0.75}
+
+    def profile(rows):
+        if len(rows) < s.presence_min_days:
+            return None
+        mean = []
+        for k in range(slots):
+            vals = [r[k] for r in rows if r[k] is not None]
+            mean.append(sum(vals) / len(vals) if vals else 0.5)
+        # a little smoothing, so one late evening does not make a 15 minute hole
+        return [(mean[k - 1] + 2 * mean[k] + mean[(k + 1) % slots]) / 4 for k in range(slots)]
+
+    by_wd = {wd: profile([r for d, r in full.items() if weekday(d) == wd]) for wd in range(7)}
+    work = profile([r for d, r in full.items() if weekday(d) < 5])
+    weekend = profile([r for d, r in full.items() if weekday(d) >= 5])
+    out = {wd: by_wd[wd] or (work if wd < 5 else weekend) for wd in range(7)}
+    return {"profiles": out, "days": len(full)}
+
+
+def person_return(person: dict, learned: dict, ts_f: list, lm_f: list, s: Settings) -> tuple[int, str]:
+    """First forecast bin this person is expected home (0 = home now) and what says so.
+
+    Learned: the first bin they are home at least presence_return_p of the time; a day with no
+    pattern counts as home. Travel time: someone heading home is back in about that long, and
+    nobody is back sooner than their drive.
+    """
+    n = len(ts_f)
+    if person.get("home_now", True):
+        return 0, "home"
+    j_learn, src = n, "learned"
+    prof = learned.get("profiles") or {}
+    for j in range(n):
+        p = prof.get(weekday(local_day(ts_f[j], lm_f[j])))
+        if p is None or p[lm_f[j] // (STEP_S // 60)] >= s.presence_return_p:
+            j_learn, src = j, ("learned" if p is not None else "unknown")
+            break
+    eta = person.get("eta_min")
+    if eta is None:
+        return j_learn, src
+    j_eta = min(n, int(max(0.0, float(eta)) * 60 // STEP_S))
+    if person.get("towards"):
+        return j_eta, "travel"
+    return (j_eta, "travel") if j_eta > j_learn else (j_learn, src)
+
+
+def presence_forecast(inp: Inputs, ts_f: list, lm_f: list, s: Settings) -> dict | None:
+    """Who is home, when the first person is expected back, and the away window that gives."""
+    if not inp.people:
+        return None
+    n_p = inp.presence_days * 86400 // STEP_S
+    g0 = ts_f[0] - n_p * STEP_S  # whole days back, so the same local minute as the forecast start
+    people = []
+    for p in inp.people:
+        home = resample(p.get("points") or [], g0, n_p, inp.data_end)
+        home = [None if v is None else (1.0 if v >= 0.5 else 0.0) for v in home]
+        learned = learn_presence(home, g0, lm_f[0], s)
+        j, src = person_return(p, learned, ts_f, lm_f, s)
+        people.append(
+            {
+                "id": p["id"],
+                "name": p.get("name") or p["id"],
+                "home": bool(p.get("home_now", True)),
+                "return_bin": j,
+                "return_ts": ts_f[j] if j < len(ts_f) else None,
+                "source": src,
+                "eta_min": p.get("eta_min"),
+                "towards": p.get("towards"),
+                "learned_days": learned["days"],
+            }
+        )
+    j_r = 0 if inp.guest else min(x["return_bin"] for x in people)
+    return {
+        "guest": inp.guest,
+        "house_away": not inp.guest and all(not x["home"] for x in people),
+        "return_bin": j_r,
+        "return_ts": ts_f[j_r] if j_r < len(ts_f) else None,
+        "window": j_r >= s.away_min_bins,
+        "people": people,
+    }
+
+
+def plan_away(
+    m: dict, ctx: dict, nodes: list, fan, heat, j_r: int, s: Settings, ti0: float, on0: int, heat0: int,
+    cool_top: float, heat_floor: float,
+) -> dict | None:
+    """The cheapest one-off setback over the running schedule that has the house back in its
+    limits by bin j_r: how deep, and how long before the return the schedule takes over again."""
+    cools = ctx.get("cools", True)
+    heats = bool(ctx.get("heats") and heat)
+    cool_opts = [cool_top, _snap(cool_top - 2 * s.step, s.step)] if cools else [None]
+    heat_opts = [heat_floor, _snap(heat_floor + 2 * s.step, s.step)] if heats else [None]
+    plain = evaluate(m, nodes, ctx, ti0, on0, s, fan=fan, heat=heat, heat0=heat0)
+    best, found_at = None, None
+    for lead in range(0, j_r):
+        j1 = j_r - lead
+        if j1 < s.away_min_bins or (found_at is not None and lead > found_at + 4):
+            break
+        for ct in cool_opts:
+            for hh in heat_opts:
+                if ct is None and hh is None:
+                    continue
+                r = evaluate(m, nodes, ctx, ti0, on0, s, fan=fan, heat=heat, heat0=heat0, away=(0, j1, ct, hh))
+                # never less comfortable than the schedule it sits on, which may itself miss a little
+                ok = r["viol"] <= max(0.0, plain["viol"]) + 1e-4
+                if ok and r["energy"] < plain["energy"] - 1e-6 and (best is None or r["energy"] < best["energy"] - 1e-9):
+                    best = r
+                    if found_at is None:
+                        found_at = lead
+    return best
+
+
 def fan_options(s: Settings) -> list:
     """Circulate windows to try, as [(minute, bool)] steps."""
     def win(a, b):
@@ -1749,14 +1915,21 @@ def run(inp: Inputs) -> dict[str, Any]:
     # Only the sides the model has learned are searched and held to their limits.
     can_cool = s.cools and bool(m.get("ac_learned", True))
     can_heat = s.heats and bool(m.get("heat_learned"))
-    ctx = make_ctx(
-        To[idx0:], S[idx0:], inp.local_minutes, s, limiting, comfort["rules"], inp.humidity_now, can_cool, can_heat
-    )
-    ctx["fo0"] = fo0
-    ctx["both"] = s.mode == "heat_cool"
-    if corr_full is not None:
-        ctx["corr"] = (corr_full[0][idx0:], corr_full[1][idx0:])
-    recovering = recovery(ctx, m, ti0, s, band, hband)
+
+    def build_ctx(away=None):
+        c = make_ctx(
+            To[idx0:], S[idx0:], inp.local_minutes, s, limiting, comfort["rules"], inp.humidity_now, can_cool, can_heat,
+            away,
+        )
+        c["fo0"] = fo0
+        c["both"] = s.mode == "heat_cool"
+        if corr_full is not None:
+            c["corr"] = (corr_full[0][idx0:], corr_full[1][idx0:])
+        return c, recovery(c, m, ti0, s, band, hband)
+
+    # The daily schedule is planned for people at home; time away is a one-off setback on top (below).
+    ctx, recovering = build_ctx()
+    presence = presence_forecast(inp, ts[idx0 : idx0 + inp.n_hor], list(inp.local_minutes), s)
     base_nodes = sorted((int(a), float(b)) for a, b in s.baseline)
     base_heat = sorted((int(a), float(b)) for a, b in s.heat_baseline)
     # A schedule without heat values leaves the thermostat's own heat setpoint alone.
@@ -1852,6 +2025,31 @@ def run(inp: Inputs) -> dict[str, Any]:
     if best is not None:  # re-run to keep the traces
         best = evaluate(m, best["nodes"], ctx, ti0, on0, s, keep=True, fan=best["fan"], heat=best["heat"], heat0=heat0)
 
+    # Everyone out: a one-off setback over the schedule that runs, back in the limits for the first return.
+    away_plan = None
+    if presence and presence["window"] and (can_cool or can_heat):
+        j_r = presence["return_bin"]
+        ctx, recovering = build_ctx([j + 1 < j_r for j in range(inp.n_hor)])  # back in limits as they walk in
+        cool_top = math.floor((s.away_max + shift) / s.step + 1e-9) * s.step
+        heat_floor = math.ceil((s.away_min - hmid) / s.step - 1e-9) * s.step
+
+        def with_away(r_nodes, r_fan, r_heat):
+            a_ = plan_away(m, ctx, r_nodes, r_fan, r_heat, j_r, s, ti0, on0, heat0, cool_top, heat_floor)
+            return a_["away"] if a_ else None
+
+        run_plan = fan_plan(inp.active_nodes) if inp.active_nodes else None
+        run_fan = run_plan if run_plan and any(f for _, f in run_plan) else None
+        run_heat = active_heat if inp.active_nodes else base_heat
+        away_plan = with_away(cool_fixed, run_fan, run_heat)
+        base = evaluate(m, base_nodes, ctx, ti0, on0, s, keep=True, heat=base_heat, heat0=heat0)
+        if active is not None:
+            active = evaluate(m, cool_fixed, ctx, ti0, on0, s, keep=True, fan=run_fan, heat=run_heat, heat0=heat0, away=away_plan)
+        if best is not None:
+            best = evaluate(
+                m, best["nodes"], ctx, ti0, on0, s, keep=True, fan=best["fan"], heat=best["heat"], heat0=heat0,
+                away=with_away(best["nodes"], best["fan"], best["heat"]),
+            )
+
     ratio = match_ratio(val, s)
     validated = ratio is not None and s.ratio_limits[0] <= ratio <= s.ratio_limits[1]
     if best is None:
@@ -1920,8 +2118,17 @@ def run(inp: Inputs) -> dict[str, Any]:
         "heat_planned": [row.get("heat") for row in plan_rows] + [None] * inp.n_hor,
         "accuracy": house_acc,
         "manual": manual,
+        "home": None,
         "rooms": [],
     }
+    if presence:
+        # 1 while anyone is home, before now from the trackers and after it from the forecast
+        past_home = []
+        tracks = [resample(p.get("points") or [], ts[a], past, inp.data_end) for p in inp.people]
+        for i in range(past):
+            vals = [tr[i] for tr in tracks]
+            past_home.append(1 if any(v is not None and v >= 0.5 for v in vals) else (None if any(v is None for v in vals) else 0))
+        series["home"] = past_home + [0 if j < presence["return_bin"] else 1 for j in range(inp.n_hor)]
     for room in rooms:
         pred = {}
         if room["coef"] is not None:
@@ -2087,6 +2294,19 @@ def run(inp: Inputs) -> dict[str, Any]:
             for k, v in resid.items()
         },
         "comfort_learned": comfort,
+        "presence": None if presence is None else {
+            **{k: v for k, v in presence.items() if k != "return_bin"},
+            "away_max": s.away_max if can_cool else None,
+            "away_min": s.away_min if can_heat else None,
+        },
+        # The setback the scheduler runs over the active schedule while everyone is out.
+        "away": None if away_plan is None else {
+            "start_ts": ts[idx0],
+            "end_ts": ts[idx0] + away_plan[1] * STEP_S,
+            "return_ts": presence["return_ts"],
+            "temp": away_plan[2],
+            "heat": away_plan[3],
+        },
         "hot_threshold": r1(hot_threshold),
         "search": {"refine_evals": n_refine, "kept_previous": kept_previous, "max_nodes": s.max_nodes},
         "plan_bins": plan_bins,

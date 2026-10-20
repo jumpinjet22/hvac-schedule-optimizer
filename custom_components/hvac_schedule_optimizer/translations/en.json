@@ -45,6 +45,23 @@
         "title": "When each room counts",
         "description": "Choose when each room's temperature has to stay under the comfort limits: always, only during awake hours, only during sleep hours, or never (shown on the card only). The thermostat itself always counts.\n\n{names}"
       },
+      "presence": {
+        "title": "Presence",
+        "description": "Pick everyone who lives here (their person entities). While all of them are out, the house is allowed to drift to the away limits, and it is back inside your comfort limits when the first person is expected home. Routines are learned per person from the last four weeks. Anyone home, or a tracker that is unavailable, means home. Leave empty to turn presence off.\n\nThe setback runs only while Run schedule is on and the model is trusted. The Guest mode switch turns it off while someone without a tracker is home.",
+        "data": {
+          "people": "People",
+          "away_max": "Away maximum (cooling)",
+          "away_min": "Away minimum (heating)"
+        }
+      },
+      "person": {
+        "title": "{name}",
+        "description": "Optional, both used only while everyone is out. A travel time sensor (Waze Travel Time, Google Travel Time or HERE, from this person to home, in minutes) moves the return earlier when they head home sooner than usual. A Proximity direction of travel sensor tells whether they are heading home.",
+        "data": {
+          "travel_sensor": "Travel time to home",
+          "direction_sensor": "Direction of travel"
+        }
+      },
       "fan": {
         "title": "Fan",
         "description": "Your thermostat reports these fan modes: {modes}.\n\nWith fan control on, the optimizer can circulate the blower to even out rooms, but only once a room has learned what the fan does (about 4 hours of fan-only running in history) and only when it costs less than running the AC or heat harder. The fan always goes back to the normal mode when a fan window ends, when you pause the schedule, and when the integration unloads.",

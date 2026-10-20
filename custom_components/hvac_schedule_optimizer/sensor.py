@@ -50,6 +50,7 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
             "outdoor_sensors": _data(c).get("outdoor_sensors"),
             "start_temp": _data(c).get("start_temp"),
             "horizon_hours": _data(c).get("horizon_hours"),
+            "presence": _data(c).get("presence"),
         },
     ),
     OptimizerSensorDescription(
@@ -81,6 +82,8 @@ DESCRIPTIONS: tuple[OptimizerSensorDescription, ...] = (
             "current_setpoint": c.scheduler.current_setpoint(),
             "next_change": c.scheduler.next_change()[0].isoformat(),
             "next_setpoint": c.scheduler.next_change()[1],
+            "away_setback": c.scheduler.away_now(),
+            "guest_mode": c.scheduler.guest,
         },
     ),
     OptimizerSensorDescription(
