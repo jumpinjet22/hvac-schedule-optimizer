@@ -25,7 +25,7 @@ from .scheduler import Scheduler
 
 CARD_FILE = "hvac-schedule-card.js"
 CARD_URL = f"/{DOMAIN}/{CARD_FILE}"
-CARD_VERSION = "0.7.0-beta.1"
+CARD_VERSION = "0.8.0-beta.1"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 SERVICE_SET_SCHEDULE = "set_schedule"
 SERVICE_RESET_COMFORT = "reset_learned_comfort"
+SERVICE_MARK_BALANCE = "mark_balance_change"
 
 _NODE = vol.Schema(
     {
@@ -78,7 +79,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             if not wanted or entry.data[CONF_CLIMATE] == wanted:
                 await entry.runtime_data.coordinator.async_reset_comfort()
 
+    async def _mark_balance(call: ServiceCall) -> None:
+        wanted = call.data.get("climate_entity")
+        for entry in hass.config_entries.async_loaded_entries(DOMAIN):
+            if not wanted or entry.data[CONF_CLIMATE] == wanted:
+                await entry.runtime_data.coordinator.async_mark_balance()
+
     hass.services.async_register(DOMAIN, SERVICE_SET_SCHEDULE, _set_schedule, schema=_SET_SCHEDULE)
+    hass.services.async_register(
+        DOMAIN, SERVICE_MARK_BALANCE, _mark_balance, schema=vol.Schema({vol.Optional("climate_entity"): cv.entity_id})
+    )
     hass.services.async_register(
         DOMAIN, SERVICE_RESET_COMFORT, _reset_comfort, schema=vol.Schema({vol.Optional("climate_entity"): cv.entity_id})
     )

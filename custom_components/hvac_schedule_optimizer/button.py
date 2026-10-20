@@ -1,4 +1,5 @@
-"""Buttons: optimize now, apply the proposal, revert to the previous schedule."""
+"""Buttons: optimize now, apply the proposal, revert to the previous schedule, and mark a vent or
+damper change so its effect on each room can be measured."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities: AddE
             OptimizerButton(c, "optimize_now", "Optimize now", "mdi:magic-staff", c.async_plan),
             OptimizerButton(c, "apply_proposal", "Apply proposed schedule", "mdi:check-circle", c.async_apply),
             OptimizerButton(c, "revert", "Revert schedule", "mdi:undo", c.async_revert),
+            OptimizerButton(c, "balance_mark", "Vents adjusted", "mdi:air-filter", c.async_mark_balance),
         ]
     )
 

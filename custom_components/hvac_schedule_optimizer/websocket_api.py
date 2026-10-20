@@ -29,6 +29,7 @@ def _payload(entry) -> dict[str, Any]:
         "result": data,
         "schedule": rt.scheduler.snapshot(),
         "learn": rt.coordinator.learn_enabled,
+        "stuck": {rid: len(rt.coordinator.stuck_days(rid)) for rid in rt.coordinator.stuck},
     }
 
 
@@ -39,6 +40,22 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_revert)
     websocket_api.async_register_command(hass, ws_toggle)
     websocket_api.async_register_command(hass, ws_comfort)
+    websocket_api.async_register_command(hass, ws_balance_mark)
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/balance_mark", vol.Optional("climate_entity"): str}
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_balance_mark(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    try:
+        entry = _find_entry(hass, msg.get("climate_entity"))
+        await entry.runtime_data.coordinator.async_mark_balance()
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], _payload(entry))
 
 
 @websocket_api.websocket_command(

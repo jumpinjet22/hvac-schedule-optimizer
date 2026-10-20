@@ -141,6 +141,13 @@ class Settings:
     presence_return_p: float = 0.25  # expected back once they are home this often at that time
     presence_min_days: int = 3  # days of a weekday (or workday/weekend) before its pattern is used
     away_min_bins: int = 4  # a setback shorter than an hour is not worth it
+    # Live fan: circulate when evening out the rooms helps the house over the next hour.
+    live_fan_bins: int = 4
+    live_fan_margin: float = 0.3  # start before a room reaches its limit
+    live_fan_gain: float = 0.15  # degree-bins of limit excess the fan must remove to be worth it
+    mix_estimate: float = 0.3  # until a room has learned the fan: share of its offset one fan bin removes
+    balance_days: int = 7
+    balance_gap: float = 1.0  # a room this far from the thermostat while the system runs is out of balance
 
     @classmethod
     def defaults(cls, fahrenheit: bool = True) -> "Settings":
@@ -174,6 +181,9 @@ class Settings:
             ref_heat=8.3,
             away_max=28.0,
             away_min=15.5,
+            live_fan_margin=0.15,
+            live_fan_gain=0.08,
+            balance_gap=0.6,
         )
 
     @property
@@ -220,6 +230,7 @@ class Inputs:
     people: list = field(default_factory=list)
     guest: bool = False  # someone without a tracker is home: never away
     presence_days: int = 28  # how far back `points` reach
+    balance_mark: float | None = None  # when vents or dampers were last adjusted, to check what it changed
 
 
 # ------------------------------------------------------------------ helpers
@@ -1580,6 +1591,175 @@ def ev_day_start(day: int) -> float:
     return day * 86400.0
 
 
+# ------------------------------------------------------------------ live fan and room balance
+def room_offset(coef: list, t: float, to: float, sun: float, duty: float, fd: float = 0.0, hd: float = 0.0) -> float:
+    a, b, c, d, e, hc = (list(coef) + [0.0] * 6)[:6]
+    return a + b * (to - t) + c * sun / 1000.0 + d * duty + e * fd + hc * hd
+
+
+def live_fan(
+    ctx_rooms: list, rooms: list, trace: dict, To_f: list, S_f: list, on0: int, fo0: float, ht0: float,
+    house_lim: list, house_lim_min: list, s: Settings, blocked: str | None = None,
+) -> dict:
+    """Whether circulating for the next hour evens the rooms out enough to be worth it.
+
+    Every limited room is predicted with and without the fan, anchored to its latest reading so a
+    room already running warm is seen as warm. The fan is wanted when it removes enough limit
+    excess across the house and makes no room worse. A room it cannot fix while the house itself
+    is fine is stuck: an airflow problem, not a thermostat one.
+    """
+    H = min(s.live_fan_bins, len(To_f))
+    by_id = {r["id"]: r for r in rooms}
+    on, ht, Tfull = trace["on"], trace.get("ht"), trace["Tfull"]
+    plan_fo = trace.get("fo")
+    fan_on = [1.0] * H + list((trace.get("fan_bins") or [0.0] * len(on))[H:])
+    fo_on = fan_only(fan_on, on, ht)
+    can_add = any((fo_on[j] or 0) - ((plan_fo or [0.0] * H)[j] or 0) > 0.01 for j in range(H))
+    margin = s.live_fan_margin
+
+    def excess(T, lim, lim_min):
+        e = 0.0
+        for i in range(1, H + 1):
+            if lim and lim[i] is not None:
+                e += max(0.0, T[i] - (lim[i] - margin))
+            if lim_min and lim_min[i] is not None:
+                e += max(0.0, (lim_min[i] + margin) - T[i])
+        return e
+
+    house = excess(Tfull, house_lim, house_lim_min)
+    out_rooms = []
+    for cr in ctx_rooms:
+        room = by_id.get(cr["id"])
+        if room is None or cr.get("coef") is None:
+            continue
+        coef = cr["coef"]
+        off_trace = room_trace(coef, Tfull[: H + 1], on, To_f, S_f, on0, plan_fo, fo0, ht, ht0)
+        delta = (room["now"] - off_trace[0]) if room.get("now") is not None else 0.0
+        T_off = [v + delta for v in off_trace]
+        if cr.get("fan"):
+            T_on = [v + delta for v in room_trace(coef, Tfull[: H + 1], on, To_f, S_f, on0, fo_on, fo0, ht, ht0)]
+        else:
+            # not learned yet: each fan bin pulls the room part of the way toward the thermostat reading
+            T_on = list(T_off)
+            for i in range(1, H + 1):
+                extra = max(0.0, (fo_on[i - 1] or 0) - ((plan_fo or [0.0] * H)[i - 1] or 0))
+                T_on[i] = T_off[i] - s.mix_estimate * extra * (T_off[i] - Tfull[i]) * min(1.0, i / 2)
+        e_off, e_on = excess(T_off, cr.get("lim"), cr.get("lim_min")), excess(T_on, cr.get("lim"), cr.get("lim_min"))
+        R = room["R"]
+        known = [v for v in R[-5:] if v is not None]
+        trend = round((known[-1] - known[0]) * 4 / max(1, len(known) - 1), 2) if len(known) >= 2 else None
+        lim0 = next((v for v in (cr.get("lim") or [])[1:] if v is not None), None)
+        lim0_min = next((v for v in (cr.get("lim_min") or [])[1:] if v is not None), None)
+        now = room.get("now")
+        over_now = 0.0
+        if now is not None:
+            over_now = max(0.0, now - lim0) if lim0 is not None else 0.0
+            over_now = max(over_now, (lim0_min - now) if lim0_min is not None else 0.0)
+        out_rooms.append(
+            {
+                "id": cr["id"],
+                "name": room.get("name"),
+                "now": None if now is None else round(now, 1),
+                "trend": trend,  # degrees per hour over the last hour
+                "excess_off": round(e_off, 2),
+                "excess_on": round(e_on, 2),
+                "over_now": round(over_now, 2),
+                "side": None if not over_now else ("hot" if lim0 is not None and now > lim0 else "cold"),
+                "estimated": not cr.get("fan"),
+                # the fan removes under half of what this room is over, while the house is fine
+                "stuck": e_off > 0.1 and (e_off - e_on) < 0.5 * e_off and house <= 0.0,
+            }
+        )
+    off_total = sum(r["excess_off"] for r in out_rooms)
+    gain = off_total - sum(r["excess_on"] for r in out_rooms)
+    worse = any(r["excess_on"] > r["excess_off"] + 0.05 for r in out_rooms)
+    if not out_rooms:
+        reason = "no room limits the plan yet"
+    elif blocked:
+        reason = blocked
+    elif off_total <= 0:
+        reason = "every room is comfortable for the next hour"
+    elif not can_add:
+        reason = "the blower already runs with the AC or heat"
+    elif worse:
+        reason = "it would push another room past its limit"
+    elif gain < s.live_fan_gain:
+        reason = "evening out the rooms would not help enough" + (" (the whole house is warm)" if house > 0 else "")
+    else:
+        reason = None
+    return {
+        "want": reason is None,
+        "reason": reason,
+        "gain": round(gain, 2),
+        "house_excess": round(house, 2),
+        "rooms": out_rooms,
+    }
+
+
+def room_balance(rooms: list, Ti: list, on: list, ht: list, To: list, S: list, lm: list, s: Settings, mark: float | None, ts: list, fo: list | None = None) -> list:
+    """How far each room runs from the thermostat while the system works, and when it is worst.
+
+    A room warmer than the thermostat while cooling (or colder while heating) is short of air; one on
+    the other side has air to spare. After a vent or damper change (mark), the room model learned
+    before it predicts the time since, and the gap between them is what the change did.
+    """
+    n = len(Ti)
+    lo = max(0, n - s.balance_days * 96)
+    out = []
+    for room in rooms:
+        R = room["R"]
+        res = {"id": room["id"], "name": room.get("name"), "cool": None, "heat": None, "change": None}
+        for side, duty, sign in (("cool", on, 1), ("heat", ht, -1)):
+            rows = [
+                (lm[i], R[i] - Ti[i])
+                for i in range(lo, n)
+                if R[i] is not None and Ti[i] is not None and duty and duty[i] is not None and duty[i] >= 0.5
+            ]
+            if len(rows) < 8:
+                continue
+            gaps = [g for _, g in rows]
+            by_hour: dict[int, list] = {}
+            for m_, g in rows:
+                by_hour.setdefault(m_ // 60, []).append(g)
+            hours = {h: sum(v) / len(v) for h, v in by_hour.items() if len(v) >= 2}
+            worst_h = (max if sign > 0 else min)(hours, key=hours.get) if hours else None
+            typical = _quantile(gaps, 0.5)
+            peak = _quantile(gaps, 0.9 if sign > 0 else 0.1)
+            # short of air: the room lags the way the system pushes; spare: it overshoots
+            short = sign * peak >= s.balance_gap
+            spare = sign * typical <= -s.balance_gap * 0.6
+            res[side] = {
+                "typical": round(typical, 1),
+                "peak": round(peak, 1),
+                "worst_hour": worst_h,
+                "bins": len(rows),
+                "need": "more" if short else "less" if spare else "ok",
+            }
+        if mark is not None:
+            before = [i for i in range(n) if ts[i] < mark]
+            after = [i for i in range(n) if ts[i] >= mark and R[i] is not None and Ti[i] is not None]
+            if len(after) >= 96 and len(before) >= s.min_room_rows:
+                fit = fit_room(
+                    R[: before[-1] + 1], Ti[: before[-1] + 1], To[: before[-1] + 1], S[: before[-1] + 1], on[: before[-1] + 1], s,
+                    (fo or [None] * n)[: before[-1] + 1] if fo else None, (ht or [None] * n)[: before[-1] + 1] if ht else None,
+                )
+                if fit["coef"] is not None:
+                    diffs, running = [], []
+                    for i in after:
+                        if To[i] is None or S[i] is None or on[i] is None:
+                            continue
+                        hd = (ht[i] or 0.0) if ht else 0.0
+                        pred = room_offset(fit["coef"], Ti[i], To[i], S[i], on[i], (fo[i] or 0.0) if fo else 0.0, hd)
+                        diffs.append((R[i] - Ti[i]) - pred)
+                        if on[i] >= 0.5 or hd >= 0.5:
+                            running.append(diffs[-1])
+                    use = running if len(running) >= 24 else diffs  # vents matter while air is moving
+                    if len(diffs) >= 96:
+                        res["change"] = {"shift": round(sum(use) / len(use), 2), "bins": len(use), "while_running": use is running}
+        out.append(res)
+    return out
+
+
 # ------------------------------------------------------------------ presence
 def local_day(ts: float, lm: int) -> int:
     """Local calendar day number of an epoch, given its local minute of day."""
@@ -2050,6 +2230,16 @@ def run(inp: Inputs) -> dict[str, Any]:
                 away=with_away(best["nodes"], best["fan"], best["heat"]),
             )
 
+    # Live fan and balance, for the schedule that actually runs.
+    running = active if active is not None else base
+    lf = live_fan(
+        ctx["rooms"], rooms, running, To[idx0:], S[idx0:], on0, fo0, float(heat0), ctx["lim"], ctx.get("lim_min") or [], s,
+        inp.fan_blocked,
+    )
+    balance = room_balance(
+        rooms, Ti[:idx0], on[:idx0], heat_b, To[:idx0], S[:idx0], lm_all[:idx0], s, inp.balance_mark, ts[:idx0], fo_hist,
+    )
+
     ratio = match_ratio(val, s)
     validated = ratio is not None and s.ratio_limits[0] <= ratio <= s.ratio_limits[1]
     if best is None:
@@ -2294,6 +2484,8 @@ def run(inp: Inputs) -> dict[str, Any]:
             for k, v in resid.items()
         },
         "comfort_learned": comfort,
+        "live_fan": lf,
+        "balance": {"rooms": balance, "mark": inp.balance_mark},
         "presence": None if presence is None else {
             **{k: v for k, v in presence.items() if k != "return_bin"},
             "away_max": s.away_max if can_cool else None,

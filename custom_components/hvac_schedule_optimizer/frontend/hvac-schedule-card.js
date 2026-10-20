@@ -6,7 +6,7 @@
  *   climate_entity: climate.living_room_thermostat   # optional if you only have one
  *   title: Cooling schedule                           # optional
  */
-const CARD_VERSION = "0.7.0-beta.1";
+const CARD_VERSION = "0.8.0-beta.1";
 const DOMAIN = "hvac_schedule_optimizer";
 const REFRESH_MS = 120000;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -76,6 +76,10 @@ svg text { font-family: var(--paper-font-body1_-_font-family, inherit); fill: va
 .msg { margin-top: 12px; padding: 9px 12px; border-radius: 10px; font-size: .8rem; line-height: 1.4;
   background: color-mix(in srgb, var(--hso-warn) 14%, transparent); color: var(--primary-text-color); }
 .msg.bad { background: color-mix(in srgb, var(--hso-bad) 14%, transparent); }
+.balance h4 { margin: 12px 0 6px; font-size: .85rem; font-weight: 500; }
+.brow { font-size: .78rem; color: var(--hso-muted); padding: 4px 0; border-top: 1px solid var(--divider-color, rgba(0,0,0,.08)); }
+.brow .bname { color: var(--primary-text-color); font-weight: 500; }
+.brow b.bad { color: var(--hso-bad); font-weight: 500; } .brow b.good { color: var(--hso-good); font-weight: 500; }
 .msg.info { background: color-mix(in srgb, var(--hso-good) 12%, transparent); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 button.b { font: inherit; font-size: .82rem; font-weight: 500; border: 0; border-radius: 999px; padding: 8px 16px; cursor: pointer;
@@ -296,6 +300,7 @@ class HvacScheduleCard extends HTMLElement {
       <div class="rt"></div>
       <div class="model"></div>
       <div class="msgs"></div>
+      <div class="balance"></div>
       <div class="nodes"></div>
       <div class="learn"></div>
       <div class="actions"></div>
@@ -306,6 +311,7 @@ class HvacScheduleCard extends HTMLElement {
       this._legend(wrap.querySelector(".legend"), r);
       this._runtime(wrap.querySelector(".rt"), r);
       this._model(wrap.querySelector(".model"), r, unit);
+      this._balance(wrap.querySelector(".balance"), r, unit);
     } else {
       wrap.querySelector(".chart").innerHTML = `<div class="empty">${
         r.status === "error" ? "No chart yet." : "Press Optimize to build the first forecast."
@@ -339,6 +345,22 @@ class HvacScheduleCard extends HTMLElement {
         : !sch.enabled ? "Run schedule is off" : !r.validated ? "the house model is not trusted yet" : !pr.window ? "someone is expected back too soon" : "it would not save anything";
       lines.push(["info", `Everyone is out, no setback: ${why}.`]);
     }
+    const lf = r.live_fan;
+    const roomTxt = (x) => `${this._esc(x.name)} ${f1(x.now)}${unit}${x.trend ? `, ${x.trend > 0 ? "rising" : "falling"} ${f1(Math.abs(x.trend))}${unit}/h` : ""}`;
+    if (sch.live_fan) {
+      lines.push(["info", `Fan circulating until ${at(sch.live_fan.until)}: ${sch.live_fan.why}.`]);
+    } else if (lf && lf.want && !sch.fan_control) {
+      const helped = lf.rooms.filter((x) => x.excess_off > x.excess_on).map(roomTxt).join("; ");
+      lines.push(["info", `Running the blower on circulate for an hour would even out ${helped}. Turn on fan control in the options to let it do that.`]);
+    } else if (lf && lf.want && sch.live_fan_paused) {
+      lines.push(["info", "The fan would help the rooms now, but it was set by hand, so live fan runs are paused for 2 hours."]);
+    }
+    const stuck = this._state.stuck || {};
+    (lf ? lf.rooms : []).filter((x) => x.stuck && x.over_now > 0).forEach((x) => {
+      const days = stuck[x.id] || 0;
+      lines.push(["warn", `Mixing the air does not help ${roomTxt(x)}, ${f1(x.over_now)}${unit} ${x.side === "cold" ? "under" : "over"} its limit while the rest of the house is fine.${
+        days >= 3 ? ` That is ${days} of the last 7 days: it likely needs rebalancing (see below).` : days ? ` Seen on ${days} day${days > 1 ? "s" : ""} this week.` : ""}`]);
+    });
     if (r.comfort && r.comfort.recovering_min > 0)
       lines.push(["warn", `The house is outside its comfort limits right now. The plan gets it back as fast as the equipment can (about ${Math.round(r.comfort.recovering_min + 30)} min), then holds the limits again.`]);
     if (r.comfort && r.comfort.heats && !r.heat_learned && r.status !== "error")
@@ -485,8 +507,46 @@ class HvacScheduleCard extends HTMLElement {
     if (reset) reset.addEventListener("click", () => this._act("comfort", { action: "reset" }));
   }
 
+  _balance(node, r, unit) {
+    const b = r.balance;
+    const rows = ((b && b.rooms) || []).filter((x) => x.cool || x.heat || x.change);
+    if (!rows.length) {
+      node.innerHTML = "";
+      return;
+    }
+    const side = (x, name) => {
+      if (!x) return "";
+      const sign = (v) => `${v > 0 ? "+" : ""}${f1(v)}${unit}`;
+      const verdict = x.need === "more" ? `<b class="bad">needs more air</b>` : x.need === "less" ? `<b class="good">can spare air</b>` : "balanced";
+      return `<div>${name}: ${sign(x.typical)} typical, ${sign(x.peak)} at worst${x.worst_hour !== null && x.worst_hour !== undefined ? ` (around ${fmtHour(x.worst_hour * 60)})` : ""} \u00b7 ${verdict}</div>`;
+    };
+    const mark = b.mark ? new Date(b.mark * 1000) : null;
+    const items = rows.map((x) => {
+      const ch = x.change;
+      const change = ch ? `<div class="note">Since the vents were adjusted: ${Math.abs(ch.shift) < 0.2 ? "no clear change" : `${f1(Math.abs(ch.shift))}${unit} ${ch.shift < 0 ? "cooler" : "warmer"} than before under the same conditions`}${ch.while_running ? " while the system runs" : ""}.</div>` : "";
+      return `<div class="brow"><div class="bname">${this._esc(x.name)}</div>${side(x.cool, "Cooling")}${side(x.heat, "Heating")}${change}</div>`;
+    });
+    const short = rows.filter((x) => (x.cool && x.cool.need === "more") || (x.heat && x.heat.need === "more")).map((x) => this._esc(x.name));
+    const spare = rows.filter((x) => (x.cool && x.cool.need === "less") || (x.heat && x.heat.need === "less")).map((x) => this._esc(x.name));
+    const advice = short.length
+      ? `<div class="sub">Open the supply vents or dampers a little to ${short.join(", ")}${spare.length ? `, and close them slightly in ${spare.join(", ")}` : ""}. Change one or two at a time, then press <b>Vents adjusted</b> and give it a few days to measure.</div>`
+      : "";
+    node.innerHTML = `<h4>Room balance <small style="font-weight:400;opacity:.7">(gap from the thermostat while the system runs, last 7 days)</small></h4>${items.join("")}${advice}
+      <div><button class="linkbtn" data-balance="1">Vents adjusted</button>${mark ? ` <small style="opacity:.7">last marked ${mark.toLocaleDateString()}</small>` : ""}</div>`;
+    const btn = node.querySelector("[data-balance]");
+    if (btn) btn.addEventListener("click", () => this._act("balance_mark"));
+  }
+
   _legend(node, r) {
     const hasActive = r.series.indoor && r.series.indoor.active;
+    const trends = {};
+    ((r.live_fan && r.live_fan.rooms) || []).forEach((x) => { trends[x.id] = x.trend; });
+    const trendOf = (id) => {
+      const v = trends[id];
+      if (v === null || v === undefined) return "";
+      const arrow = v >= 0.3 ? "\u2191" : v <= -0.3 ? "\u2193" : "\u2192";
+      return ` <small title="${v >= 0 ? "+" : ""}${f1(v)}\u00b0/h over the last hour" style="opacity:.8">${arrow}</small>`;
+    };
     const acc = (a) => (a ? ` <small style="opacity:.7">\u00b1${f1(a.mae)}\u00b0</small>` : "");
     const planned = [].concat(r.series.indoor_planned || [], ...(r.series.rooms || []).map((x) => x.planned || [])).some((v) => v !== null && v !== undefined);
     node.innerHTML = [
@@ -504,7 +564,7 @@ class HvacScheduleCard extends HTMLElement {
       ...(r.series.rooms || []).map((room, k) => {
         const tag = room.trusted ? ROOM_WHEN[room.when] || room.when : "learning";
         const off = this._roomHidden(room);
-        return `<span class="room ${off ? "off" : ""}" data-room="${this._esc(room.id)}" role="button" title="Tap to ${off ? "show" : "hide"}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)}${acc(room.accuracy)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
+        return `<span class="room ${off ? "off" : ""}" data-room="${this._esc(room.id)}" role="button" title="Tap to ${off ? "show" : "hide"}"><i style="border-color:${ROOM_COLORS[k % ROOM_COLORS.length]}"></i>${this._esc(room.name)}${trendOf(room.id)}${acc(room.accuracy)} <small style="opacity:.7">(${this._esc(tag)})</small></span>`;
       }),
     ].join("");
     node.querySelectorAll(".room").forEach((n) =>

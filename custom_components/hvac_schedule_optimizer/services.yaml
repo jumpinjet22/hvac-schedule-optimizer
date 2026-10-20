@@ -17,3 +17,10 @@ reset_learned_comfort:
       selector:
         entity:
           domain: climate
+mark_balance_change:
+  fields:
+    climate_entity:
+      required: false
+      selector:
+        entity:
+          domain: climate

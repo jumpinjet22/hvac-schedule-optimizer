@@ -14,7 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
 from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.storage import Store
@@ -150,6 +150,8 @@ UNDO_S = 600  # a change reversed within this long was a slip, not a preference
 PRESENCE_DAYS = 28  # four of each weekday to learn routines from
 AWAY_DELAY_S = 600  # the house counts as empty once the last person has been gone this long
 TRAVEL_STALE_S = 1800  # a travel time older than this is ignored
+LIVE_FAN_RUN_S = 1800  # each live fan decision circulates at least this long
+STUCK_DAYS = 3  # days in a week a room is over its limit, unfixed by mixing, before the rebalancing alert
 
 
 def _minutes(state) -> float | None:
@@ -186,6 +188,9 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.comfort_forgotten: dict[str, float] = {}
         self.learn_enabled = True
         self._away_timer: CALLBACK_TYPE | None = None
+        self._rooms: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.rooms")
+        self.stuck: dict[str, dict[str, float]] = {}  # {room: {local date: worst degrees over}}
+        self.balance_mark: float | None = None
 
     @property
     def _unit(self) -> str:
@@ -201,6 +206,13 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.comfort_events = list(c.get("events") or [])
             self.comfort_forgotten = dict(c.get("forgotten") or {})
         self.learn_enabled = bool(c.get("learn", True))
+        r = await self._rooms.async_load() or {}
+        if r.get("unit") in (None, self._unit):
+            self.stuck = dict(r.get("stuck") or {})
+        self.balance_mark = r.get("mark")
+
+    def _rooms_data(self) -> dict:
+        return {"unit": self._unit, "stuck": self.stuck, "mark": self.balance_mark}
 
     def _forecast_data(self) -> dict:
         return {"unit": self._unit, "bins": {str(k): v for k, v in self.forecast_bins.items()}}
@@ -411,6 +423,8 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if want:
                     self.hass.async_create_task(self.scheduler.async_auto_switch(want, why))
             self.hass.async_create_task(self._async_apply_away(result))
+            self.hass.async_create_task(self._async_live_fan(result))
+            self._track_stuck(result)
         except Exception as err:  # noqa: BLE001 - surface any failure as a status instead of failing setup
             # Log once per distinct failure, not on every refresh.
             if str(err) != self._last_error:
@@ -560,6 +574,7 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             people=people,
             guest=self.scheduler.guest,
             presence_days=PRESENCE_DAYS,
+            balance_mark=self.balance_mark,
         )
         try:
             result = await self.hass.async_add_executor_job(engine.run, inputs)
@@ -682,6 +697,89 @@ class OptimizerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await sch.async_set_away(
             {"start": start, "end": away["end_ts"], "return": away["return_ts"], "temp": away["temp"], "heat": away["heat"]}
         )
+
+    # ---------------------------------------------------------- live fan and balance
+    async def _async_live_fan(self, result: dict[str, Any]) -> None:
+        """Circulate while evening the rooms out helps the house; stop at once if humidity says no."""
+        if result.get("status") == "error":
+            return
+        sch = self.scheduler
+        lf = result.get("live_fan") or {}
+        if not sch.enabled or self.fan_config() is None:
+            return
+        if self.fan_blocked():
+            await sch.async_set_live_fan(None)
+            return
+        if lf.get("want"):
+            helped = [r["name"] for r in lf.get("rooms") or [] if r["excess_off"] > r["excess_on"]]
+            why = "evening out " + ", ".join(helped) if helped else "evening out the rooms"
+            await sch.async_set_live_fan(dt_util.utcnow().timestamp() + LIVE_FAN_RUN_S, why)
+
+    def _track_stuck(self, result: dict[str, Any]) -> None:
+        """Count the days a room is over its limit while mixing cannot fix it and the house is fine."""
+        lf = result.get("live_fan")
+        if not lf:
+            return
+        today = dt_util.now().date()
+        changed = False
+        for room in lf.get("rooms") or []:
+            if room.get("stuck") and room.get("over_now", 0) > 0:
+                days = self.stuck.setdefault(room["id"], {})
+                key = today.isoformat()
+                days[key] = round(max(days.get(key, 0.0), room["over_now"]), 2)
+                days["side"] = room.get("side") or days.get("side", "hot")
+                changed = True
+        cutoff = (today - timedelta(days=14)).isoformat()
+        for rid in list(self.stuck):
+            self.stuck[rid] = {k: v for k, v in self.stuck[rid].items() if k == "side" or k >= cutoff}
+            if not any(k != "side" for k in self.stuck[rid]):
+                del self.stuck[rid]
+                changed = True
+        if changed:
+            self._rooms.async_delay_save(self._rooms_data, 60)
+        self._update_balance_issues(result)
+
+    def stuck_days(self, room_id: str) -> list[str]:
+        week = (dt_util.now().date() - timedelta(days=6)).isoformat()
+        return sorted(k for k in self.stuck.get(room_id, {}) if k != "side" and k >= week)
+
+    def _update_balance_issues(self, result: dict[str, Any]) -> None:
+        """A repair notice per room that keeps running over its limit in a way mixing cannot fix."""
+        balance = {b["id"]: b for b in (result.get("balance") or {}).get("rooms") or []}
+        names = {r["id"]: r.get("name") or r["id"] for r in (result.get("live_fan") or {}).get("rooms") or []}
+        for rid in set(self.stuck) | {i for i in balance}:
+            issue = f"rebalance_{self.config_entry.entry_id}_{rid}"
+            days = self.stuck_days(rid)
+            if len(days) < STUCK_DAYS:
+                if not days:
+                    ir.async_delete_issue(self.hass, DOMAIN, issue)
+                continue
+            side = self.stuck[rid].get("side", "hot")
+            info = (balance.get(rid) or {}).get("cool" if side == "hot" else "heat") or {}
+            hour = info.get("worst_hour")
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue,
+                is_fixable=False,
+                is_persistent=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="rebalance_warm" if side == "hot" else "rebalance_cold",
+                translation_placeholders={
+                    "room": names.get(rid) or room_name(self.hass, rid),
+                    "days": str(len(days)),
+                    "worst": f"{max(self.stuck[rid][d] for d in days):.1f}",
+                    "gap": "" if info.get("peak") is None else f"{abs(info['peak']):.1f}",
+                    "hour": "" if hour is None else f"{hour:02d}:00",
+                },
+            )
+
+    async def async_mark_balance(self) -> None:
+        """Vents or dampers were just adjusted: measure what that changes from here on."""
+        self.balance_mark = dt_util.utcnow().timestamp()
+        self.stuck = {}
+        await self._rooms.async_save(self._rooms_data())
+        await self.async_refresh()
 
     async def async_set_guest(self, value: bool) -> None:
         await self.scheduler.async_set_guest(value)

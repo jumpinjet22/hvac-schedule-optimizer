@@ -138,5 +138,15 @@
         "none": "No heating"
       }
     }
+  },
+  "issues": {
+    "rebalance_warm": {
+      "title": "{room} needs more cooling air",
+      "description": "{room} ran above its comfort limit on {days} of the last 7 days (up to {worst}° over) while the rest of the house was fine, and running the fan to mix the air does not fix it. While the AC runs it sits about {gap}° warmer than the thermostat, worst around {hour}.\n\nThat points to airflow: open {room}'s supply vents or dampers a little, close them slightly in rooms that run cool, and check the return path (a closed door with no return starves a room). After adjusting, press **Vents adjusted** so the integration can measure the effect. This notice clears itself after a week without the problem."
+    },
+    "rebalance_cold": {
+      "title": "{room} needs more heating air",
+      "description": "{room} ran below its comfort minimum on {days} of the last 7 days (up to {worst}° under) while the rest of the house was fine, and running the fan to mix the air does not fix it. While the heat runs it sits about {gap}° colder than the thermostat, worst around {hour}.\n\nThat points to airflow: open {room}'s supply vents or dampers a little, close them slightly in rooms that run warm, and check the return path. After adjusting, press **Vents adjusted** so the integration can measure the effect. This notice clears itself after a week without the problem."
+    }
   }
 }

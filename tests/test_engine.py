@@ -929,3 +929,62 @@ def test_heating_sets_back_while_away():
     j_r = (pr["return_ts"] - inp.data_end) // STEP
     ni = s["now_index"]
     assert min(s["indoor"]["active"][ni + j_r : ni + j_r + 8]) >= inp.settings.awake_min - 0.05
+
+
+# ------------------------------------------------------------------ live fan and balance
+def _warm_room(fan_effect, offset=2.8):
+    inp = _fan_house(fan_effect=fan_effect, offset=offset)
+    inp.rooms[0]["when"] = "always"
+    inp.settings.fan_enabled = True
+    return inp
+
+
+def test_live_fan_runs_when_evening_out_helps():
+    inp = _warm_room(-2.0)
+    r = engine.run(inp)
+    lf = r["live_fan"]
+    room = lf["rooms"][0]
+    assert room["excess_off"] > 0 and room["excess_on"] < room["excess_off"] / 2 and not room["estimated"]
+    assert lf["want"] and lf["reason"] is None and not room["stuck"]
+    assert room["trend"] is not None
+
+
+def test_live_fan_stuck_room_when_mixing_does_not_help():
+    inp = _warm_room(0.0, offset=3.5)
+    r = engine.run(inp)
+    lf = r["live_fan"]
+    room = lf["rooms"][0]
+    assert not lf["want"] and "not help" in lf["reason"]
+    assert room["stuck"] and room["over_now"] > 0
+
+
+def test_live_fan_held_by_humidity():
+    inp = _warm_room(-2.0)
+    inp.fan_blocked = "Indoor humidity 70% is over the 60% fan limit"
+    lf = engine.run(inp)["live_fan"]
+    assert not lf["want"] and lf["reason"].startswith("Indoor humidity")
+
+
+def test_balance_short_and_spare_rooms():
+    inp, _ = _synthetic()
+    inp.rooms = [
+        {"id": "sensor.bed", "name": "Bed", "when": "always", "points": _room_points(inp, 0.3, 0.0, 2.0)},
+        {"id": "sensor.den", "name": "Den", "when": "always", "points": _room_points(inp, 0.0, 0.0, -1.5, seed=4)},
+        {"id": "sensor.hall", "name": "Hall", "when": "always", "points": _room_points(inp, 0.2, 0.0, 0.0, seed=5)},
+    ]
+    bal = {b["id"]: b for b in engine.run(inp)["balance"]["rooms"]}
+    assert bal["sensor.bed"]["cool"]["need"] == "more" and bal["sensor.bed"]["cool"]["peak"] >= 2.0
+    assert bal["sensor.den"]["cool"]["need"] == "less"
+    assert bal["sensor.hall"]["cool"]["need"] == "ok"
+    assert bal["sensor.bed"]["heat"] is None  # no heating in this history
+
+
+def test_balance_change_is_measured_against_the_model_from_before():
+    inp, _ = _synthetic()
+    mark = inp.data_end - 3 * 86400
+    before = [p for p in _room_points(inp, 0.3, 0.0, 2.0) if p[0] < mark]
+    after = [p for p in _room_points(inp, 0.3, 0.0, 0.5, seed=9) if p[0] >= mark]
+    inp.rooms = [{"id": "sensor.bed", "name": "Bed", "when": "always", "points": before + after}]
+    inp.balance_mark = mark
+    ch = engine.run(inp)["balance"]["rooms"][0]["change"]
+    assert ch is not None and ch["while_running"] and -1.7 < ch["shift"] < -1.2

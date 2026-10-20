@@ -7,7 +7,7 @@ its model actually matches reality, then designs a daily schedule that uses less
 while staying inside comfort limits you set. It also runs the schedule itself, so you do not
 need another scheduler integration.
 
-> Version 0.7. Cooling, heating and presence. Single thermostat per entry. Includes a dashboard card.
+> Version 0.8. Cooling, heating, presence, live fan and room balance. Single thermostat per entry. Includes a dashboard card.
 
 ## How it works
 
@@ -103,6 +103,42 @@ With a small AC on a very hot day, a setback saves less than you might expect, b
 the house soaks up has to be removed again before you get home. The card shows the plan and the
 estimated change.
 
+### Live fan and room balance
+
+The thermostat setpoint belongs to the whole house, so a single warm (or cold) room is never fixed
+by turning the house down. Moving the air is the fix.
+
+- **Every 15 minutes** each room is checked: its reading now, its trend over the last hour, and where
+  it is heading over the next hour with and without the blower on circulate.
+- **The fan runs when evening the rooms out helps the house as a whole**: a room heading past its
+  limit while others have room to spare. It never pushes another room past its limit, runs at least
+  30 minutes at a time, and goes back to normal when the rooms have evened out.
+- It does **not** run when every room is warm (mixing warm air with warm air does nothing), when
+  indoor humidity is over the fan limit, or for 2 hours after anyone sets the fan by hand.
+- Until a room has learned what the fan does to it, a simple mixing estimate is used, and every live
+  run adds to what it learns.
+- Needs fan control turned on (Configure, Fan). Without it, the card only says when the fan would help.
+
+**When mixing does not help.** A room that runs over its limit while the rest of the house is fine,
+and that circulation cannot fix, has an airflow problem. The card says so straight away, and after
+3 days in a week a repair notice appears under **Settings, Repairs** ("Bedroom needs more cooling
+air").
+
+**Room balance.** The card's balance panel shows, for every room, how far it runs from the
+thermostat while the system is cooling or heating (typical and at worst, and the hour it is worst),
+over the last 7 days:
+
+- **needs more air**: warmer than the thermostat while cooling, or colder while heating;
+- **can spare air**: the other way round;
+- with advice on which vents or dampers to open a little and which to close slightly.
+
+This is a temperature gap, not an airflow measurement. The model cannot tell you CFM; for that you
+need a flow hood or a Manual J/D calculation. What it can do is rank the rooms and check your
+changes: after adjusting vents or dampers, press **Vents adjusted** (on the card, the button entity,
+or the `hvac_schedule_optimizer.mark_balance_change` service). After a day, each room is compared
+with what the model learned before the change predicts for the same weather and runtime, and the
+card shows how many degrees the change moved it.
+
 ### Learning from your changes
 
 When you change the setpoint yourself (in the app or at the wall) while the schedule is running,
@@ -174,7 +210,8 @@ folder and restart.
    fail because of a room, and keeps one only if it costs less than cooling the whole house
    harder. A schedule node with `fan: true` circulates until the next node. The fan always goes
    back to the normal mode when a window ends, when the schedule is paused, and when the
-   integration unloads, and it is never touched while the schedule has no fan nodes.
+   integration unloads, and it is never touched except by fan nodes and live fan runs (see
+   [Live fan and room balance](#live-fan-and-room-balance)).
 4. **Turn off any other scheduler for this thermostat** (Climate Scheduler, automations that
    set the temperature on a timer) so they do not fight.
 
@@ -194,6 +231,7 @@ folder and restart.
 | `button.*_optimize_now` | Run the optimizer immediately. |
 | `button.*_apply_proposed_schedule` | Make the proposal the active schedule (refused if the model is not trusted). |
 | `button.*_revert_schedule` | Go back to the previous schedule. |
+| `button.*_vents_adjusted` | You changed vents or dampers: measure what it does to each room from now on. |
 
 Service `hvac_schedule_optimizer.set_schedule` sets the active schedule by hand:
 

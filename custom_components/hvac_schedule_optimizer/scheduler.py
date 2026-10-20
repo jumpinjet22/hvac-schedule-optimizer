@@ -20,6 +20,7 @@ from .const import DOMAIN, STORAGE_VERSION, run_mode, setpoints_of
 
 MODE_HOLD_S = 3 * 3600  # auto switching keeps a mode at least this long
 MANUAL_MODE_PAUSE_S = 12 * 3600  # and stays away for this long after someone picks a mode by hand
+MANUAL_FAN_PAUSE_S = 2 * 3600  # live fan runs back off this long after someone sets the fan by hand
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ class Scheduler:
     schedule has heat values), in heat_cool both, never closer than deadband(). Other
     modes (off, dry, fan only) are left alone. With auto switching opted in, the
     coordinator asks for heat or cool through async_auto_switch.
+
+    Live fan: the coordinator can ask for circulation until a time when evening the rooms out
+    helps the house; it never changes a setpoint for it. A fan mode picked by hand pauses it.
 
     Away: while everyone is out the coordinator sets a one-off setback with fixed start and
     end times, laid over the schedule, so it never repeats the next day. It ends at its end
@@ -77,6 +81,9 @@ class Scheduler:
         self.away: dict[str, Any] | None = None  # {"start", "end", "return" epochs, "temp", "heat"}
         self.away_cancelled = False  # a manual change while away: no setback until someone is home again
         self.guest = False
+        self.live_fan: dict[str, Any] | None = None  # {"since", "until" epochs, "why"}
+        self.manual_fan_at: float | None = None
+        self._fan_set: tuple[str, float] | None = None  # (mode, when) of our last fan write
 
     # ---------------------------------------------------------- persistence
     async def async_load(self) -> None:
@@ -159,6 +166,22 @@ class Scheduler:
         old, new = event.data["old_state"], event.data["new_state"]
         if old is None or new is None:
             return
+        if (
+            old.attributes.get("fan_mode") != new.attributes.get("fan_mode")
+            and not self._ours(new.context)
+            and new.attributes.get("fan_mode") is not None
+            and old.attributes.get("fan_mode") is not None
+            and not (
+                self._fan_set
+                and self._fan_set[0] == new.attributes.get("fan_mode")
+                and dt_util.utcnow().timestamp() - self._fan_set[1] < 120
+            )
+        ):
+            self.manual_fan_at = dt_util.utcnow().timestamp()  # someone set the fan: hands off for a while
+            if self.live_fan:
+                self.live_fan = None
+            self.fan_forced = False  # their fan setting now, not ours to put back
+            self._notify()
         if old.state != new.state:
             if not self._ours(new.context) and new.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN) and old.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 self.manual_mode_at = dt_util.utcnow().timestamp()  # someone picked a mode: auto switching backs off
@@ -261,6 +284,33 @@ class Scheduler:
             self._arm()
         self._notify()
 
+    def live_fan_now(self, now: datetime | None = None) -> dict[str, Any] | None:
+        if not self.live_fan:
+            return None
+        return self.live_fan if (now or dt_util.utcnow()).timestamp() < self.live_fan["until"] else None
+
+    def live_fan_paused(self) -> bool:
+        return bool(self.manual_fan_at and dt_util.utcnow().timestamp() - self.manual_fan_at < MANUAL_FAN_PAUSE_S)
+
+    async def async_set_live_fan(self, until: float | None, why: str = "") -> None:
+        """Circulate until `until` (extending a run in progress), or stop now with None."""
+        now = dt_util.utcnow().timestamp()
+        if until is None:
+            if self.live_fan is None:
+                return
+            self.live_fan = None
+        else:
+            if self.live_fan_paused():
+                return
+            since = self.live_fan["since"] if self.live_fan_now() else now
+            self.live_fan = {"since": since, "until": max(until, (self.live_fan_now() or {}).get("until", 0)), "why": why}
+        if self.enabled:
+            state = self.hass.states.get(self.climate_entity)
+            if state is not None and run_mode(state) is not None:
+                await self._async_apply_fan(state)
+            self._arm()
+        self._notify()
+
     async def async_set_guest(self, value: bool) -> None:
         self.guest = value
         await self._async_save()
@@ -307,6 +357,8 @@ class Scheduler:
             "heat_now": self.current_heat(),
             "mode_note": self.mode_note,
             "away": self.away_now(),
+            "live_fan": self.live_fan_now(),
+            "live_fan_paused": self.live_fan_paused(),
             "away_cancelled": self.away_cancelled,
             "guest": self.guest,
             "next_change": when.isoformat(),
@@ -323,6 +375,8 @@ class Scheduler:
         when, _ = self.next_change()
         if (away := self.away_now()) is not None:
             when = min(when, dt_util.as_local(dt_util.utc_from_timestamp(away["end"])))  # back to the schedule
+        if (live := self.live_fan_now()) is not None:
+            when = min(when, dt_util.as_local(dt_util.utc_from_timestamp(live["until"])))  # fan back to normal
         self._unsub = async_track_point_in_time(self.hass, self._async_fire, when)
 
     async def _async_fire(self, now: datetime) -> None:
@@ -422,12 +476,13 @@ class Scheduler:
     async def _async_apply_fan(self, state, now: datetime | None = None) -> None:
         cfg = self.fan_config()
         uses_fan = any(n.get("fan") for n in self.nodes)
-        if cfg is None or not (uses_fan or self.fan_forced):
+        live = self.live_fan_now(now)
+        if cfg is None or not (uses_fan or live or self.fan_forced):
             self.fan_note = None
             return
         normal, circ = cfg
         local = dt_util.as_local(now or dt_util.now())
-        want = uses_fan and engine.fan_at(self.nodes, local.hour * 60 + local.minute)
+        want = bool(live) or (uses_fan and engine.fan_at(self.nodes, local.hour * 60 + local.minute))
         self.fan_note = None
         if want and (blocked := self.fan_blocked()):
             self.fan_note = blocked
@@ -447,6 +502,7 @@ class Scheduler:
             except HomeAssistantError as err:
                 _LOGGER.warning("Could not set %s fan to %s: %s", self.climate_entity, mode, err)
                 return
+            self._fan_set = (mode, dt_util.utcnow().timestamp())
         if forced != self.fan_forced:
             self.fan_forced = forced
             await self._async_save()
