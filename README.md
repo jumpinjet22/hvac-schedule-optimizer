@@ -3,22 +3,43 @@
 A self-contained, weather-aware thermostat scheduler for Home Assistant.
 
 It learns how your house behaves from the history Home Assistant already has, checks that
-its model actually matches reality, then designs a daily schedule that uses less AC energy
-while staying inside comfort limits you set. It also runs the schedule itself, so you do not
-need another scheduler integration.
+its model actually matches reality, then designs a daily schedule that costs less to heat and
+cool while staying inside comfort limits you set. It also runs the schedule itself, so you do
+not need another scheduler integration.
 
 > Version 0.8. Cooling, heating, presence, live fan and room balance. Single thermostat per entry. Includes a dashboard card.
 
+**Highlights**
+
+- Learns a thermal model of your house and checks it against real runtime before trusting it.
+- Plans cooling and heating (furnace, electric, heat pump, dual fuel) around the weather forecast.
+- Away setbacks from each person's learned routine, with optional travel-time sensors.
+- Per-room sensors, live fan circulation and a room balance report.
+- Learns from your manual setpoint changes, but only ever tightens your limits.
+- Its own Lovelace card: history, forecast and plan on one chart.
+
+**Requirements:** Home Assistant 2024.12 or newer, the recorder (on by default) with a few days
+of thermostat history, and a `climate` entity that reports `hvac_action`. Weather comes from
+Open-Meteo, so Home Assistant needs internet access.
+
+**Contents:** [How it works](#how-it-works) ·
+[Heating](#heating) · [Presence](#presence) · [Live fan and room balance](#live-fan-and-room-balance) ·
+[Learning from your changes](#learning-from-your-changes) · [Install](#install) · [Setup](#setup) ·
+[Entities](#entities) · [Services](#services) · [Dashboard card](#dashboard-card) ·
+[Suggested first week](#suggested-first-week) · [Behavior notes](#behavior-notes) ·
+[Limitations](#limitations-planned-work) · [Development](#development)
+
 ## How it works
 
-1. Reads the thermostat's recorded indoor temperature, `hvac_action` (cooling or not) and
+1. Reads the thermostat's recorded indoor temperature, `hvac_action` (cooling, heating or idle) and
    setpoint from the recorder, plus past and forecast weather and sunshine from
    [Open-Meteo](https://open-meteo.com) (free, no key).
 2. Fits a simple model of the house:
 
-   `dTin/dt = k*(Tout - Tin) + g*Sun + q - c*AC_on`
+   `dTin/dt = k*(Tout - Tin) + g*Sun + q - c*AC_on + h*Heat_on`
 
-   (leakiness, solar gain, steady internal heat, and how fast your AC pulls the house down).
+   (leakiness, solar gain, steady internal heat, how fast your AC pulls the house down, and how
+   fast your heat warms it; the heat term is only fitted when there is heating in the history).
 3. **Learns where your thermostat really switches.** Many thermostats (especially ones on
    remote or averaged sensors) keep cooling well below the setpoint on the reading used here.
    The start and stop points are read from every AC cycle in history, and used only if they
@@ -219,11 +240,11 @@ folder and restart.
 
 | Entity | What it does |
 | --- | --- |
-| `sensor.*_status` | `ready`, `needs_review`, `no_comfortable_schedule`, `error`. Attributes hold the fitted model, validation and any error message. |
-| `sensor.*_proposed_schedule` | What the optimizer wants to run, with expected indoor range and AC hours. |
+| `sensor.*_status` | `waiting` (before the first run), `ready`, `needs_review`, `no_comfortable_schedule`, `error`. Attributes hold the fitted model, validation and any error message. |
+| `sensor.*_proposed_schedule` | What the optimizer wants to run, with expected indoor range and AC and heat hours. |
 | `sensor.*_active_schedule` | What is running now, where it came from, the previous schedule, and the next change. |
 | `sensor.*_estimated_energy_change` | Estimated change against your baseline, in percent. |
-| `sensor.*_model_match` | Predicted over actual AC runtime. Near 1.0 is good. |
+| `sensor.*_model_match` | Predicted over actual AC runtime. Near 1.0 is good. Attributes include the heating match and learned thermostat band. |
 | `switch.*_run_schedule` | On: this integration sets the thermostat at each node time. |
 | `switch.*_auto_apply_optimizer` | On: the daily run replaces the active schedule when the model is trusted. |
 | `switch.*_learn_from_my_changes` | On: manual setpoint changes are kept and repeated turn-downs tighten the comfort limits. |
@@ -233,7 +254,15 @@ folder and restart.
 | `button.*_revert_schedule` | Go back to the previous schedule. |
 | `button.*_vents_adjusted` | You changed vents or dampers: measure what it does to each room from now on. |
 
-Service `hvac_schedule_optimizer.set_schedule` sets the active schedule by hand:
+## Services
+
+Every service takes an optional `climate_entity` to pick the entry when you have more than one.
+
+| Service | What it does |
+| --- | --- |
+| `hvac_schedule_optimizer.set_schedule` | Sets the active schedule by hand (example below). |
+| `hvac_schedule_optimizer.reset_learned_comfort` | Forgets everything learned from your manual changes. |
+| `hvac_schedule_optimizer.mark_balance_change` | Same as **Vents adjusted**: measure each room against the model from now on. |
 
 ```yaml
 service: hvac_schedule_optimizer.set_schedule
@@ -251,7 +280,7 @@ to add. Edit a dashboard, **Add card**, pick **HVAC Schedule**, or use YAML:
 ```yaml
 type: custom:hvac-schedule-card
 climate_entity: climate.living_room_thermostat  # optional if you only have one entry
-title: Cooling schedule                          # optional
+title: My schedule                               # optional, defaults to the mode
 ```
 
 It shows 24 hours of history and the next 24 hours on one chart: outdoor temperature behind
@@ -289,11 +318,13 @@ If the card does not show up after installing, restart Home Assistant and hard r
 ## Limitations (planned work)
 
 - One schedule for every day of the week.
-- Needs a few days of AC cycling in the recorder to fit the model.
-- Energy savings assume compressor power rises about 1.2% per degree of outdoor temperature
+- Needs a few days of AC (or heat) cycling in the recorder to fit the model.
+- Cooling cost assumes compressor power rises about 1.2% per degree of outdoor temperature
   above ~82 F. It is a rough constant, not measured from your unit.
 
 ## Development
+
+CI runs hassfest, the HACS validator and the engine tests on every push.
 
 The model and optimizer live in `custom_components/hvac_schedule_optimizer/engine.py` with no
 Home Assistant imports, so they run anywhere:
